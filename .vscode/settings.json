@@ -1,0 +1,33 @@
+{
+    // 本工程根目录就是 CMake 源目录 (BeyondFOC.ioc 在这一层生成 CMakeLists.txt)
+    // 构建目录由 CMakePresets.json 决定: ${workspaceFolder}/build/Debug
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "cmake.useCMakePresets": "always",
+    "cmake.configureOnOpen": true,
+    "cmake.environment": {
+        // 默认 PATH 里只有 aarch64 工具链, arm-none-eabi-* 需要手动加到最前面
+        "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+    },
+    "files.associations": {
+        "*.h": "c",
+        "*.c": "c",
+        "*.ld": "linkerscript",
+        "*.s": "arm"
+    },
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.errorSquiggles": "enabled",
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.default.compilerPath": "C:/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gcc.exe",
+    "C_Cpp.default.intelliSenseMode": "gcc-arm",
+    "C_Cpp.default.cStandard": "c11",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/Debug/compile_commands.json",
+    "files.exclude": {
+        "**/.git": true,
+        "**/build": false
+    },
+    "search.exclude": {
+        "**/build": true
+    },
+    "terminal.integrated.defaultProfile.windows": "Command Prompt",
+    "task.autoDetect": "off"
+}

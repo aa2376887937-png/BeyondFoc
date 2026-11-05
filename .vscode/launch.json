@@ -1,0 +1,69 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (CMSIS-DAP)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/BeyondFOC.elf",
+            "servertype": "openocd",
+            "serverpath": "C:/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe",
+            "searchDir": [
+                "C:/openocd-v0.12.0-i686-w64-mingw32/share/openocd/scripts"
+            ],
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32g4x.cfg"
+            ],
+            "gdbPath": "C:/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gdb.exe",
+            "armToolchainPath": "C:/ArmGNUToolchain/14.2.rel1/bin",
+            "device": "STM32G474RE",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "preLaunchTask": "Build Project"
+        },
+        {
+            "name": "Debug (ST-Link)",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/BeyondFOC.elf",
+            "servertype": "openocd",
+            "serverpath": "C:/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe",
+            "searchDir": [
+                "C:/openocd-v0.12.0-i686-w64-mingw32/share/openocd/scripts"
+            ],
+            "configFiles": [
+                "interface/stlink.cfg",
+                "target/stm32g4x.cfg"
+            ],
+            "gdbPath": "C:/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gdb.exe",
+            "armToolchainPath": "C:/ArmGNUToolchain/14.2.rel1/bin",
+            "device": "STM32G474RE",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "preLaunchTask": "Build Project"
+        },
+        {
+            "name": "Attach (CMSIS-DAP)",
+            "type": "cortex-debug",
+            "request": "attach",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/BeyondFOC.elf",
+            "servertype": "openocd",
+            "serverpath": "C:/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe",
+            "searchDir": [
+                "C:/openocd-v0.12.0-i686-w64-mingw32/share/openocd/scripts"
+            ],
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32g4x.cfg"
+            ],
+            "gdbPath": "C:/ArmGNUToolchain/14.2.rel1/bin/arm-none-eabi-gdb.exe",
+            "armToolchainPath": "C:/ArmGNUToolchain/14.2.rel1/bin",
+            "device": "STM32G474RE",
+            "showDevDebugOutput": "none"
+        }
+    ]
+}

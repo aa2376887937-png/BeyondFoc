@@ -1,0 +1,17 @@
+# 构建产物（CMake / arm-none-eabi）
+build/
+*.o
+*.obj
+*.elf
+*.map
+*.su
+*.bin
+*.hex
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 编辑器临时文件
+*.swp
+*~

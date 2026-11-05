@@ -1,0 +1,272 @@
+{
+    "version": "2.0.0",
+    // 本工程: BeyondFOC (STM32G474RETx), STM32CubeMX 生成的 CMake 工程。
+    // 构建目录由 CMakePresets.json 决定: ${workspaceFolder}/build/Debug
+    // 目标文件: build/Debug/BeyondFOC.elf
+    // 工具链: C:/ArmGNUToolchain/14.2.rel1/bin (arm-none-eabi-*)
+    // 调试器: C:/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe (已在 PATH 中)
+    "tasks": [
+        {
+            "label": "CMake: Configure (Debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    // PATH 里默认只有 aarch64 工具链, 必须把 arm-none-eabi 放到最前面
+                    "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "clear": true
+            }
+        },
+        {
+            "label": "Build Project",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+                }
+            },
+            "dependsOn": "CMake: Configure (Debug)",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "clear": true
+            },
+            "problemMatcher": {
+                "owner": "gcc",
+                "fileLocation": [
+                    "autoDetect",
+                    "${workspaceFolder}"
+                ],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|note):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            }
+        },
+        {
+            "label": "Clean Build",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Debug",
+                "--target",
+                "clean"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+                }
+            },
+            "group": "build",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "Flash (CMSIS-DAP)",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "interface/cmsis-dap.cfg",
+                "-f",
+                "target/stm32g4x.cfg",
+                "-c",
+                "program BeyondFOC.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build/Debug"
+            },
+            "dependsOn": "Build Project",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "Flash (ST-Link)",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "interface/stlink.cfg",
+                "-f",
+                "target/stm32g4x.cfg",
+                "-c",
+                "program BeyondFOC.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build/Debug"
+            },
+            "dependsOn": "Build Project",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "CMake: Configure (Release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--preset",
+                "Release"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "clear": true
+            }
+        },
+        {
+            "label": "Build Project (Release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "--preset",
+                "Release"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "C:/ArmGNUToolchain/14.2.rel1/bin;${env:PATH}"
+                }
+            },
+            "dependsOn": "CMake: Configure (Release)",
+            "group": "build",
+            "problemMatcher": {
+                "owner": "gcc",
+                "fileLocation": [
+                    "autoDetect",
+                    "${workspaceFolder}"
+                ],
+                "pattern": {
+                    "regexp": "^(.*):(\\d+):(\\d+):\\s+(warning|error|note):\\s+(.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "column": 3,
+                    "severity": 4,
+                    "message": 5
+                }
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "focus": false,
+                "clear": true
+            }
+        },
+        {
+            "label": "Flash (Release, CMSIS-DAP)",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "interface/cmsis-dap.cfg",
+                "-f",
+                "target/stm32g4x.cfg",
+                "-c",
+                "program BeyondFOC.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build/Release"
+            },
+            "dependsOn": "Build Project (Release)",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "Flash (Release, ST-Link)",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "interface/stlink.cfg",
+                "-f",
+                "target/stm32g4x.cfg",
+                "-c",
+                "program BeyondFOC.elf verify reset exit"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build/Release"
+            },
+            "dependsOn": "Build Project (Release)",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        },
+        {
+            "label": "Erase Chip",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f",
+                "interface/cmsis-dap.cfg",
+                "-f",
+                "target/stm32g4x.cfg",
+                "-c",
+                "init; reset halt; stm32l4x mass_erase 0; reset run; exit"
+            ],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "clear": true
+            }
+        }
+    ]
+}
