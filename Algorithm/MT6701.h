@@ -33,8 +33,17 @@ namespace mt6701
 
 		void Set_Pole_Pairs(uint8_t pole_pairs_) { pole_pairs = pole_pairs_; }
 
-		// 速度二阶巴特沃斯低通（按监控任务 1kHz 的采样率设计）
+		// 速度二阶巴特沃斯低通（差分速度源用，按监控任务 4kHz 的采样率设计）
 		void Set_Speed_Filter_Hz(float fc_hz_);
+
+		// PLL 速度输出的一阶低通 (Hz)，0 = 关闭。
+		// 在 20kHz 帧消费里执行，系数用真实帧间隔 dt_s 算，所以改帧率不影响截止。
+		// 它和 PLL 一起决定速度反馈带宽，速度环带宽必须明显低于这两者。
+		void Set_Speed_Lpf_Hz(float hz_);
+
+		// 速度来源开关：true=PLL，false=差分+巴特沃斯
+		void Set_Speed_Source_Pll(bool on_) { use_pll = on_; }
+		bool Is_Speed_Source_Pll() const { return use_pll; }
 
 		// 速度锁相环：用角度闭环估计速度（机械 rad/s）
 		void Set_Pll_Bandwidth(float hz_, float damping_);
@@ -54,7 +63,8 @@ namespace mt6701
 
 		// 电流环中断里调用：用最近一帧的角度 + 电角速度外推到现在。
 		// 只是乘加，不解析帧、不碰 SPI；序号锁保证读到一致的 angle/speed/时间戳。
-		float Get_Predicted_Angle(uint32_t now_cycles) const;
+		// extra_ahead_s：额外前抬的时间（如 PWM 影子寄存器延迟 ~1.5 个周期）
+		float Get_Predicted_Angle(uint32_t now_cycles, float extra_ahead_s = 0.0f) const;
 
 		// 每个控制周期调用；编码器的角度已经由 Consume() 算好，
 		// 这里只处理"请求清零"这类跨任务的小动作。
@@ -110,12 +120,19 @@ namespace mt6701
 		float sp_x1 = 0.0f, sp_x2 = 0.0f;
 		float sp_y1 = 0.0f, sp_y2 = 0.0f;
 
+		bool use_pll = true;				// 速度来源开关
+
 		// 速度 PLL 状态（机械 rad / rad/s）
 		float pll_kp = 0.0f;
 		float pll_ki = 0.0f;
 		float pll_theta = 0.0f;
 		float pll_omega = 0.0f;
 		float pll_integral = 0.0f;
+
+		// PLL 输出低通
+		float speed_raw = 0.0f;		// 未滤波速度（角度外推用，避免二次滞后）
+		float speed_lpf = 0.0f;		// 一阶低通输出（Get_Speed/遥测/控制用）
+		float lpf_tau = 0.0f;		// 0 = 关闭
 
 		float direction = 1.0f;
 		uint16_t error_cnt = 0;

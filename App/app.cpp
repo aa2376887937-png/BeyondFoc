@@ -37,9 +37,11 @@ namespace app
 		, control_loop(adc1, pwm1, tim2, config::kPolePairs, command_queue, control_channel, power_channel)
 		, monitor(spi_encoder, encoder_sensor, power, encoder_channel, power_channel)
 		, command_router(uart_port, command_queue)
-		, telemetry(uart_port, control_channel, encoder_channel, power_channel, system_state)
+		, telemetry(uart_port, control_channel, encoder_channel, power_channel, system_state,
+					control_loop.Capture())
 	{
 		control_loop.Set_Encoder(&encoder_sensor);
+		control_loop.Set_Frame_Source(&spi_encoder);
 	}
 
 	void Runtime::Init()
@@ -64,7 +66,7 @@ namespace app
 		system_state.boot_stage = 5;
 
 		monitor.Init();										// 编码器 + ADC2 规则组慢速量
-		control_loop.Init();								// 控制器参数（ADC1 注入组由 TIM1 更新中断启动）
+		control_loop.Init();								// 控制器参数（ADC1 注入组由 TIM1 TRGO 硬件触发）
 
 		// 上电自动校零（此时功率级没开，电流就是 0）。
 		// 注入中断已经打开，用临界区避免 ISR 看到改到一半的校准状态。
@@ -72,8 +74,8 @@ namespace app
 		control_loop.Current().Start_Calibration();
 		taskEXIT_CRITICAL();
 
-		// 现在才允许 TIM1 更新中断启动 ADC 注入组，避免在控制器/校准准备好之前进电流环
-		pwm1.Enable_Update_It();
+		// TIM1 更新中断已不再需要（ADC 注入组硬件触发，JEOC 中断独立使能）。
+		// 保留调用无害：更新中断只做心跳，不再驱动采样。
 		system_state.boot_stage = 6;
 
 		if (config::kSvpwmViewDefaultOn)

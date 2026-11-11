@@ -54,6 +54,7 @@ namespace encoder
 
 		volatile bool reading = false;
 		uint32_t read_start_cycles = 0;
+		uint32_t last_taken_cycles = 0;		// 上次交给上层的帧时间戳（挡重复帧）
 		uint16_t transport_err = 0;
 
 		static SpiEncoder *encoder_list[4];

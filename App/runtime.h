@@ -56,7 +56,10 @@ namespace app
 		mt6701::Sensor encoder_sensor;
 
 		// 串口
-		uint8_t uart_rx_dma[64] = {};
+		// 必须 >= 最大命令帧（当前 4+87+1 = 92 字节）。
+		// 64 字节时 DMA 会在帧中间就满，重启 DMA 的间隙会丢字节，
+		// 表现就是遥测正常、但所有命令都解析不出来。
+		uint8_t uart_rx_dma[256] = {};
 		uart::Port uart_port;
 
 		// 生产者/消费者通道

@@ -1,4 +1,5 @@
 #include "FOC_math.h"
+#include "RC_cordic.h"
 
 /*==============================================================================
  * Clarke / Park / Inv_Park / Inv_Clarke / Norm_Angle / Limit / Lp_Filter
@@ -22,6 +23,9 @@ namespace
 
 void foc_math::Init_Lut()
 {
+	// CORDIC 硬件三角：初始化成 COSINE/NRES=2/Q1.31 模式（真正的计算单元）
+	cordic::Init();
+
 	for (int i = 0; i < kSinLutSize; i++)
 	{
 		sin_lut[i] = sinf((float)i * (TWO_PI / (float)kSinLutSize));
@@ -34,6 +38,17 @@ foc_math::SinCos foc_math::Sin_Cos(float angle)
 {
 	SinCos out;
 
+#if 1
+	// CORDIC 硬件：G474 协处理器。修复：折叠周期是 2.0（=2π）不是 1.0，
+	// 之前 a - (int)a 的 mod-1 折叠在角度越过 ±π 时跳到错误象限
+	// （表现为扫频波形直流偏移/半波）。
+	{
+		const cordic::SinCosResult r = cordic::Sin_Cos(angle);
+		out.sin = r.sin;
+		out.cos = r.cos;
+		return out;
+	}
+#else
 	if (!lut_ready)			// 没初始化就退回库函数（正常不会走到）
 	{
 		out.sin = sinf(angle);
@@ -73,6 +88,7 @@ foc_math::SinCos foc_math::Sin_Cos(float angle)
 	out.cos = c0 + (c1 - c0) * f;
 
 	return out;
+#endif
 }
 
 /*==============================================================================

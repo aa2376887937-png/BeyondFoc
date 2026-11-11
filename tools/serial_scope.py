@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BeyondFOC 上位机（UART3 / 4,000,000 bps）
+BeyondFOC 上位机（UART3 / 2,000,000 bps）
 
 * 左侧/顶部：选串口 -> 连接；选模式、给目标（电流 A / 转速 rpm）、点「使能」
 * 曲线：三相电流、SVPWM 占空比、转速、母线电压，实时刷新
@@ -17,11 +17,12 @@ MCU -> PC (type 0x01, len 66)
               + enc_deg(f32) + enc_rpm(i16) + enc_crc(u16) + enc_raw(u32)
               + elec_offset_deg(f32)
 
-PC -> MCU (type 0x10, len 12)
-    A5 5A | 10 | 0C | payload(12) | XOR
-    payload = enable(u8) mode(u8) iq_mA(i16) speed_rpm(i16) flags(u16) reserved(u32)
+PC -> MCU (type 0x10, len 87)
+    A5 5A | 10 | 57 | payload(87) | XOR
+    payload = enable(u8) mode(u8) iq_mA(i16) speed_rpm(i16) flags(u16)
+              + 位置/整定/测试字段 + MIT 6 个 float
 
-    mode: 0=电流闭环 1=开环强拖 2=波形观察 3=转速闭环
+    mode: 0=电流闭环 1=开环强拖 2=波形观察 3=转速闭环 4=位置闭环 5=MIT 阻抗
     status bit0=使能 bit1=转速环 bit2=编码器有效 bit3=电流零偏校准中
            bit4=ADC校准失败 bit5=电角度标定中 bit6=电角度标定完成 bit7=电角度标定失败
            bit8-11=启动阶段 bit12-14=固件实际模式 bit15=最近200ms收到命令
@@ -50,24 +51,38 @@ HEAD0 = 0xA5
 HEAD1 = 0x5A
 
 TYPE_SCOPE = 0x01
-PAYLOAD_LEN = 136
+PAYLOAD_LEN = 145
 FRAME_LEN = 4 + PAYLOAD_LEN + 1
+TYPE_CAPTURE = 0x02
+CAP_PAYLOAD_LEN = 140
+CAP_FRAME_LEN = 4 + CAP_PAYLOAD_LEN + 1
+CAP_CHUNK = 8
 # Ia Ib Ic | Da Db Dc | Id Iq | Vbus | rpm | status | seq | raw_a raw_b raw_c
 # | isr_avg isr_max | enc_deg | enc_rpm | enc_crc_err | enc_raw(24bit)
 # | elec_offset_deg | kp_d ki_d kp_q ki_q | offs_a offs_b offs_c | iq_target id_target
 # | speed_kp speed_ki pos_kp pos_kd | speed_target | pos_target
-# | test_freq vd vq | ld_x10 lq_x10
-UNPACK_FMT = "<8fHhHHHHHHHfhHIfffffHHHfffffffffffHH"
+# | test_freq vd vq | ld_x10 lq_x10 | motor_temp driver_temp thermal_state rsv
+UNPACK_FMT = "<8fHhHHHHHHHfhHIfffffHHHfffffffffffHHbbBBfB"
 
 TYPE_CMD = 0x10
-CMD_PAYLOAD = 46
-CMD_FMT = "<BBhhHiffffhffffBff"   # enable mode iq_mA rpm flags pos·0.01 kp_d ki_d kp_q ki_q id_mA speed_kp speed_ki pos_kp pos_kd test_type test_amp test_freq
+# MIT 追加 6 个 float：pos_des(rad) vel_des(rad/s) kp(N·m/rad) kd(N·m·s/rad) tau_ff(N·m) tau_limit(N·m)
+CMD_FMT = "<BBhhHiffffhffffBffffffffff"   # enable mode iq_mA rpm flags pos·0.01 kp_d ki_d kp_q ki_q id_mA speed_kp speed_ki pos_kp pos_kd test_type test_amp test_freq plan_vmax plan_accel + MIT 6 floats
+CMD_PAYLOAD = struct.calcsize(CMD_FMT)
 FLAG_CAL_CURRENT = 0x0001
 FLAG_RESET_ANGLE = 0x0002
 FLAG_CAL_ANGLE = 0x0004
 FLAG_TUNE_PI = 0x0008
+FLAG_PI_INCREMENTAL = 0x0010
 FLAG_TUNE_SPEED_PI = 0x0020
 FLAG_TUNE_POS_PI = 0x0040
+FLAG_CAPTURE = 0x0080
+FLAG_L_IDENT = 0x0100
+FLAG_COG_LEARN = 0x0200
+FLAG_COG_ENABLE = 0x0400
+FLAG_COG_INVERT = 0x0800
+
+# 和 app_config.h 的 kMotorKt 保持一致（J/B 辨识换算用）
+MOTOR_KT = 1.5 * 7 * 0.0025
 
 # ADC 满量程电流：3.3V / (5mΩ × 50) = 13.2A，界面按 90% 给上限
 CURRENT_FULL_SCALE_A = 13.2
@@ -80,7 +95,7 @@ PLOT_DEFS = (
     ("iq",    "iq",     ("iq", "iq_t")),
     ("id",    "id",     ("id", "id_t")),
     ("speed", "转速",   ("speed", "speed_t")),
-    ("enc",   "角度",   ("enc_deg", "pos_t")),
+    ("enc",   "角度",   ("enc_deg", "elec_deg", "pos_t")),
     ("vbus",  "母线",   ("vbus",)),
 )
 PLOT_CHANNELS = {pid: ch for pid, _t, ch in PLOT_DEFS}
@@ -90,15 +105,16 @@ SAMPLE_RATE_HZ = 1000.0       # 固件每 1ms 发一帧
 MAX_PLOT_POINTS = 1500        # 每次刷新最多画这么多点（超了等间隔抽点）
 SMOOTH_WINDOW = 20            # 显示平滑：20 点滑动平均，1kHz 下约 50Hz 低通
 DEFAULT_REFRESH_HZ = 25       # 默认刷新率，可调
-BAUDRATE = 4_000_000
+BAUDRATE = 2_000_000
 CMD_PERIOD_MS = 50            # 命令 20Hz 重发，丢一帧也没关系
 
-MODE_CURRENT, MODE_OPENLOOP, MODE_VIEW, MODE_ENCODER, MODE_POSITION = 0, 1, 2, 3, 4
+MODE_CURRENT, MODE_OPENLOOP, MODE_VIEW, MODE_ENCODER, MODE_POSITION, MODE_MIT = 0, 1, 2, 3, 4, 5
 MODE_CHOICES = (
     (MODE_CURRENT, "电流闭环"),
     (MODE_OPENLOOP, "开环强拖"),
     (MODE_ENCODER, "转速闭环"),
     (MODE_POSITION, "位置闭环"),
+    (MODE_MIT, "MIT 阻抗"),
 )
 FW_MODE_TEXT = {
     MODE_CURRENT: "电流闭环",
@@ -106,6 +122,7 @@ FW_MODE_TEXT = {
     MODE_VIEW: "波形观察",
     MODE_ENCODER: "转速闭环",
     MODE_POSITION: "位置闭环",
+    MODE_MIT: "MIT 阻抗",
 }
 STAGE_TEXT = ["上电", "ADC校准中", "TIM2已启动", "串口已挂", "PWM已启动", "采样已启动", "初始化完", "就绪"]
 
@@ -119,10 +136,12 @@ class FrameParser:
         self.bad = 0
         self.last_type = None
         self.last_len = None
+        self.captures = []
 
     def feed(self, data: bytes):
         self.buf += data
         out = []
+        self.captures = []
         header = bytes((HEAD0, HEAD1))
 
         while True:
@@ -144,6 +163,29 @@ class FrameParser:
             ln = self.buf[3]
             self.last_type = typ
             self.last_len = ln
+
+            if typ == TYPE_CAPTURE and ln == CAP_PAYLOAD_LEN:
+                if len(self.buf) < CAP_FRAME_LEN:
+                    break
+
+                frame = bytes(self.buf[:CAP_FRAME_LEN])
+                chk = 0
+                for b in frame[2:4 + ln]:
+                    chk ^= b
+                if chk != frame[-1]:
+                    self.bad += 1
+                    del self.buf[:2]
+                    continue
+
+                payload = frame[4:4 + ln]
+                seq, total = struct.unpack_from("<HH", payload, 0)
+                count = payload[4]
+                nch = payload[5]
+                decim, fs = struct.unpack_from("<HH", payload, 6)
+                vals = struct.unpack_from("<%df" % (count * nch), payload, 10)
+                self.captures.append((seq, total, count, nch, vals, decim, fs))
+                del self.buf[:CAP_FRAME_LEN]
+                continue
 
             if typ != TYPE_SCOPE or ln != PAYLOAD_LEN:
                 self.bad += 1
@@ -171,12 +213,18 @@ class FrameParser:
 def build_cmd(enable, mode, iq_ma, speed_rpm, flags=0, position_cdeg=0,
               kp_d=0.0, ki_d=0.0, kp_q=0.0, ki_q=0.0, id_ma=0,
               speed_kp=0.0, speed_ki=0.0, pos_kp=0.0, pos_kd=0.0,
-              test_type=0, test_amp=0.0, test_freq=0.0):
+              test_type=0, test_amp=0.0, test_freq=0.0,
+              plan_vmax=0.0, plan_accel=0.0,
+              mit_pos_des=0.0, mit_vel_des=0.0, mit_kp=0.0, mit_kd=0.0,
+              mit_tau_ff=0.0, mit_tau_limit=0.0):
     """PC -> MCU 一帧命令"""
     payload = struct.pack(CMD_FMT, enable, mode, int(iq_ma), int(speed_rpm), flags,
                           int(position_cdeg), float(kp_d), float(ki_d), float(kp_q), float(ki_q),
                           int(id_ma), float(speed_kp), float(speed_ki), float(pos_kp), float(pos_kd),
-                          int(test_type), float(test_amp), float(test_freq))
+                          int(test_type), float(test_amp), float(test_freq),
+                          float(plan_vmax), float(plan_accel),
+                          float(mit_pos_des), float(mit_vel_des), float(mit_kp), float(mit_kd),
+                          float(mit_tau_ff), float(mit_tau_limit))
     body = bytes((TYPE_CMD, len(payload))) + payload
     chk = 0
     for b in body:
@@ -192,7 +240,7 @@ class DataStore:
     等间隔抽点。9 条曲线 × 6000 点全量转换/绘制是 CPU 大户，按需转换能省一大截。
     """
 
-    KEYS = ("ia", "ib", "ic", "da", "db", "dc", "speed", "speed_t", "iq", "iq_t", "id", "id_t", "vbus", "enc_deg", "pos_t", "test_freq")
+    KEYS = ("ia", "ib", "ic", "da", "db", "dc", "speed", "speed_t", "iq", "iq_t", "id", "id_t", "vbus", "enc_deg", "elec_deg", "pos_t", "test_freq")
 
     def __init__(self, maxlen=30000):
         self.lock = threading.Lock()
@@ -214,7 +262,50 @@ class DataStore:
         self.vq = 0.0
         self.ld_x10 = 0
         self.lq_x10 = 0
+        self.motor_temp = -100
+        self.driver_temp = -100
+        self.thermal_state = 0
+        self.psi_state = 0
+        self.psi_mwb = 0.0
+        self.cog_state = 0
         self.proto = (None, None)
+
+        # 扫频：固件在板内做完 I/Q 解调，结果临时放在 vd/vq 字段里
+        self.sweep_collect = False
+        self.sweep_pts = []
+        self.sweep_last_f = None
+
+        # 板内捕获：4 路曲线，按块追加
+        self.cap = [[] for _ in range(4)]
+        self.cap_total = 0
+        self.cap_seq = 0
+        self.cap_done = False
+        self.cap_decim = 1
+        self.cap_fs = 20000
+
+    def start_capture(self):
+        with self.lock:
+            self.cap = [[] for _ in range(4)]
+            self.cap_total = 0
+            self.cap_seq = 0
+            self.cap_done = False
+            self.cap_decim = 1
+            self.cap_fs = 20000
+
+    def add_capture(self, seq, total, count, nch, vals, decim=1, fs=20000):
+        with self.lock:
+            if self.cap_done:
+                return
+            if total > 0:
+                self.cap_total = total
+            self.cap_decim = max(1, int(decim))
+            self.cap_fs = max(1, int(fs))
+            for i in range(count):
+                for c in range(min(nch, 4)):
+                    self.cap[c].append(vals[i * nch + c])
+            self.cap_seq = seq
+            if self.cap_total > 0 and (seq + 1) * CAP_CHUNK >= self.cap_total:
+                self.cap_done = True
 
     def add_bytes(self, n):
         with self.lock:
@@ -233,6 +324,8 @@ class DataStore:
             self.bad = 0
             self.rx_bytes = 0
             self.last_seq = None
+            self.sweep_pts = []
+            self.sweep_last_f = None
 
     def add(self, v):
         (ia, ib, ic, da, db, dc, idd, iq, vbus_mv, rpm,
@@ -240,7 +333,8 @@ class DataStore:
          enc_deg, enc_rpm, enc_crc, enc_raw, elec_offset_deg,
          kp_d, ki_d, kp_q, ki_q, offs_a, offs_b, offs_c, iq_t, id_t,
          spd_kp, spd_ki, pos_kp, pos_kd, spd_t, pos_t, test_freq, vd, vq,
-         ld_x10, lq_x10) = v
+         ld_x10, lq_x10, motor_temp, driver_temp, thermal_state, psi_state,
+         psi_mwb, cog_state) = v
 
         # 固件已经过滤过 NaN/Inf，这里再兜一层，坏帧直接丢
         if not all(math.isfinite(x) for x in (ia, ib, ic, da, db, dc, idd, iq)):
@@ -264,6 +358,13 @@ class DataStore:
             c["id_t"].append(id_t)
             c["vbus"].append(vbus_mv / 1000.0)
             c["enc_deg"].append(enc_deg)
+
+            # 电角度 = 机械角 × 7 + 零位，归一化到 [-180, 180)
+            ea = (enc_deg * 7.0 + elec_offset_deg) % 360.0
+            if ea > 180.0:
+                ea -= 360.0
+            c["elec_deg"].append(ea)
+
             c["pos_t"].append(pos_t)
             c["test_freq"].append(test_freq)
             self.raw = (ra, rb, rc)
@@ -277,8 +378,20 @@ class DataStore:
             self.vq = vq
             self.ld_x10 = ld_x10
             self.lq_x10 = lq_x10
+            self.motor_temp = motor_temp
+            self.driver_temp = driver_temp
+            self.thermal_state = thermal_state
+            self.psi_state = psi_state
+            self.psi_mwb = psi_mwb
+            self.cog_state = cog_state
             self.status = status
             self.frames += 1
+
+            # 扫频：固件把每个频点的 幅值(dB)/相位(°) 放在 vd/vq 里
+            if self.sweep_collect and test_freq > 0.0 and abs(vd) < 500.0:
+                if self.sweep_last_f is None or abs(test_freq - self.sweep_last_f) > 1e-3:
+                    self.sweep_pts.append((float(test_freq), float(vd), float(vq)))
+                    self.sweep_last_f = float(test_freq)
 
             if self.last_seq is not None:
                 gap = (seq - self.last_seq - 1) & 0xFFFF
@@ -366,6 +479,8 @@ class SerialReader(QtCore.QThread):
                 self.store.add_bytes(len(data))
                 frames = parser.feed(data)
                 self.store.set_proto(parser.last_type, parser.last_len)
+                for cap in parser.captures:
+                    self.store.add_capture(*cap)
                 for values in frames:
                     self.store.add(values)
         except Exception as exc:            # noqa: BLE001
@@ -402,8 +517,7 @@ class DemoReader(QtCore.QThread):
         if len(data) < 4 + CMD_PAYLOAD + 1:
             return
         try:
-            enable, mode, iq_ma, rpm, _flags, _res, _kpd, _kid, _kpq, _kiq, _idma, _skp, _ski, _pkp, _pki = \
-                struct.unpack(CMD_FMT, data[4:4 + CMD_PAYLOAD])
+            enable, mode, iq_ma, rpm = struct.unpack_from("<BBhh", data, 4)
         except struct.error:
             return
         self.enable = bool(enable)
@@ -482,37 +596,49 @@ class ScopeWindow(QtWidgets.QMainWindow):
         self.angle_cal_flag = False
         self._port_text = "未连接"
 
-        pg.setConfigOptions(antialias=False, background="k", foreground="w")
+        pg.setConfigOptions(antialias=False, background="#0d1c30", foreground="#d6e4f5")
 
         self.setStyleSheet("""
-QMainWindow { background: #1e1f22; }
-QWidget { color: #dcdcdc; font-size: 12px; }
+QMainWindow { background: #10243d; }
+QWidget { color: #dfeaf7; font-size: 12px; background: #10243d; }
+QScrollArea { background: #10243d; border: none; }
+QScrollArea > QWidget > QWidget { background: #10243d; }
+QTabWidget::pane {
+    border: 1px solid #2b4f7a; border-radius: 6px; background: #10243d;
+}
+QTabBar::tab {
+    background: #17324f; color: #bcd4ee; padding: 6px 14px;
+    border: 1px solid #2b4f7a; border-bottom: none;
+    border-top-left-radius: 5px; border-top-right-radius: 5px;
+}
+QTabBar::tab:selected { background: #24507f; color: #ffffff; }
+QTabBar::tab:hover { background: #1d4066; }
 QGroupBox {
-    border: 1px solid #3a3d42; border-radius: 6px;
-    margin-top: 10px; padding: 8px 8px 6px 8px;
+    border: 1px solid #2b4f7a; border-radius: 6px;
+    margin-top: 10px; padding: 8px 8px 6px 8px; background: #142b47;
 }
 QGroupBox::title {
     subcontrol-origin: margin; subcontrol-position: top left;
-    left: 10px; padding: 0 5px; color: #8fbaff; font-weight: bold;
+    left: 10px; padding: 0 5px; color: #7fb6ff; font-weight: bold;
 }
 QPushButton {
-    background: #2f3237; border: 1px solid #4a4e55; border-radius: 4px;
-    padding: 5px 12px; color: #e0e0e0;
+    background: #1c3a5c; border: 1px solid #35618f; border-radius: 4px;
+    padding: 5px 12px; color: #e4eef9;
 }
-QPushButton:hover { background: #3a3e45; border-color: #6b7280; }
-QPushButton:disabled { color: #6a6a6a; border-color: #33363b; }
+QPushButton:hover { background: #26507d; border-color: #5b8fc9; }
+QPushButton:disabled { color: #6f8296; border-color: #24405e; }
 QComboBox, QSpinBox, QDoubleSpinBox {
-    background: #26282c; border: 1px solid #444850; border-radius: 4px;
-    padding: 3px 6px; selection-background-color: #3d6fb5;
+    background: #17324f; border: 1px solid #35618f; border-radius: 4px;
+    padding: 3px 6px; selection-background-color: #2f6fb5;
 }
-QComboBox QAbstractItemView { background: #26282c; selection-background-color: #3d6fb5; }
-QCheckBox { spacing: 5px; color: #d0d0d0; }
-QSlider::groove:horizontal { height: 4px; background: #3a3d42; border-radius: 2px; }
+QComboBox QAbstractItemView { background: #17324f; selection-background-color: #2f6fb5; }
+QCheckBox { spacing: 5px; color: #cfe0f5; }
+QSlider::groove:horizontal { height: 4px; background: #24405e; border-radius: 2px; }
 QSlider::handle:horizontal {
     width: 12px; margin: -5px 0; border-radius: 6px; background: #6ea8ff;
 }
-QStatusBar { background: #232529; }
-QStatusBar QLabel { color: #cfcfcf; }
+QStatusBar { background: #0b1a2b; }
+QStatusBar QLabel { color: #cfe0f5; }
 """)
 
         # ================= 顶部：连接 =================
@@ -573,6 +699,29 @@ QStatusBar QLabel { color: #cfcfcf; }
         )
         self.lbl_isr.setStyleSheet("color:#8f8; font-family:Consolas,monospace")
         row1.addWidget(self.lbl_isr)
+
+        # 在线磁链估计（q 轴稳态反电势法）
+        row1.addSpacing(10)
+        self.lbl_psi = QtWidgets.QLabel("ψf --.-mWb")
+        self.lbl_psi.setMinimumWidth(130)
+        self.lbl_psi.setToolTip(
+            "在线磁链估计（方法一：q 轴稳态反电势）。\n"
+            "需要在 |ωe|>300rad/s、|iq|>0.2A、电压未饱和、非扫频时才会更新。\n"
+            "数值长时间不动说明当前工况不满足估计条件。")
+        self.lbl_psi.setStyleSheet("color:#8f8; font-family:Consolas,monospace")
+        row1.addWidget(self.lbl_psi)
+
+        # 温度标签：电机/驱动 NTC + 过温状态
+        row1.addSpacing(16)
+        self.lbl_temp = QtWidgets.QLabel("电机 --°C  驱动 --°C")
+        self.lbl_temp.setMinimumWidth(230)
+        self.lbl_temp.setToolTip(
+            "电机 NTC（绕组内）和驱动板 NTC。\n"
+            "电机 ≥80°C 自动降流、≥100°C 停机；驱动 ≥90°C 停机；带 8°C 回差恢复。\n"
+            "NTC? 表示热敏开路/短路，按 25°C 处理不会误触发。"
+        )
+        self.lbl_temp.setStyleSheet("color:#d0d0d0; font-family:Consolas,monospace")
+        row1.addWidget(self.lbl_temp)
 
         row1.addStretch(1)
 
@@ -662,6 +811,33 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.sp_pos.valueChanged.connect(lambda v: self._sync_slider(self.sl_pos, int(round(v * 10.0))))
         ctrl.addWidget(self.sl_pos, 4, 2)
 
+        # 位置最速规划的运行参数（每次命令下发，0 = 固件保持当前值）
+        ctrl.addWidget(QtWidgets.QLabel("规划速度 (rad/s):"), 5, 0)
+        self.sp_plan_vmax = QtWidgets.QDoubleSpinBox()
+        self.sp_plan_vmax.setRange(0.1, 300.0)
+        self.sp_plan_vmax.setSingleStep(5.0)
+        self.sp_plan_vmax.setDecimals(1)
+        self.sp_plan_vmax.setValue(100.0)
+        self.sp_plan_vmax.setMinimumWidth(90)
+        self.sp_plan_vmax.setToolTip(
+            "最速轨迹规划的速度上限（机械 rad/s）。\n"
+            "100 rad/s ≈ 955 rpm。\n"
+            "小位移走不到这个值，只有长位移才会出现匀速段。")
+        ctrl.addWidget(self.sp_plan_vmax, 5, 1)
+
+        ctrl.addWidget(QtWidgets.QLabel("规划加速度 (rad/s²):"), 6, 0)
+        self.sp_plan_accel = QtWidgets.QDoubleSpinBox()
+        self.sp_plan_accel.setRange(1.0, 5000.0)
+        self.sp_plan_accel.setSingleStep(50.0)
+        self.sp_plan_accel.setDecimals(0)
+        self.sp_plan_accel.setValue(300.0)
+        self.sp_plan_accel.setMinimumWidth(90)
+        self.sp_plan_accel.setToolTip(
+            "最速轨迹规划的最大加速度（机械 rad/s²）。\n"
+            "越大运动越快，但受电机转矩/电流限幅约束。\n"
+            "300 ≈ 17190 rpm/s，对关节偏温和。")
+        ctrl.addWidget(self.sp_plan_accel, 6, 1)
+
         # 按钮
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setSpacing(6)
@@ -670,7 +846,8 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.btn_enable.setCheckable(True)
         self.btn_enable.setMinimumHeight(30)
         self.btn_enable.setStyleSheet(
-            "QPushButton{background:#333;color:#ddd;border:1px solid #666;border-radius:4px}"
+            "QPushButton{background:#1c3a5c;color:#e4eef9;border:1px solid #35618f;border-radius:4px}"
+            "QPushButton:hover{background:#26507d;border-color:#5b8fc9}"
             "QPushButton:checked{background:#8b1a1a;color:#fff;border:1px solid #ff5555}"
         )
         btn_row.addWidget(self.btn_enable)
@@ -693,7 +870,7 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.btn_angle_cal.clicked.connect(self.request_angle_calibration)
         btn_row.addWidget(self.btn_angle_cal)
 
-        ctrl.addLayout(btn_row, 5, 0, 1, 3)
+        ctrl.addLayout(btn_row, 7, 0, 1, 3)
 
         # ================= 第四行：电流环 PI 在线整定 =================
         row4 = QtWidgets.QGridLayout()
@@ -759,16 +936,116 @@ QStatusBar QLabel { color: #cfcfcf; }
 
         panel = QtWidgets.QWidget()
         pv = QtWidgets.QVBoxLayout(panel)
-        pv.setContentsMargins(8, 6, 8, 6)
+        pv.setContentsMargins(6, 6, 6, 6)
         pv.setSpacing(6)
+
+        # 左侧改成三个页签，避免一长串分组框上下滚：
+        #   运行：模式/目标/规划参数 + 显示
+        #   整定：电流环/转速环/位置环 PI
+        #   测试：正弦测试
+        self.left_tabs = QtWidgets.QTabWidget()
+        self.left_tabs.setDocumentMode(True)
+
+        page_run = QtWidgets.QWidget()
+        lay_run = QtWidgets.QVBoxLayout(page_run)
+        lay_run.setContentsMargins(6, 6, 6, 6)
+        lay_run.setSpacing(6)
+
+        page_tune = QtWidgets.QWidget()
+        lay_tune = QtWidgets.QVBoxLayout(page_tune)
+        lay_tune.setContentsMargins(6, 6, 6, 6)
+        lay_tune.setSpacing(6)
+
+        page_test = QtWidgets.QWidget()
+        lay_test = QtWidgets.QVBoxLayout(page_test)
+        lay_test.setContentsMargins(6, 6, 6, 6)
+        lay_test.setSpacing(6)
+
+        # ================= MIT 阻抗参数（力矩级，旁路转速环） =================
+        self.page_mit = QtWidgets.QWidget()
+        mit_lay = QtWidgets.QGridLayout(self.page_mit)
+        mit_lay.setContentsMargins(6, 6, 6, 6)
+        mit_lay.setHorizontalSpacing(8)
+        mit_lay.setVerticalSpacing(6)
+
+        mit_lay.addWidget(QtWidgets.QLabel("目标位置 (deg):"), 0, 0)
+        self.sp_mit_pos = QtWidgets.QDoubleSpinBox()
+        self.sp_mit_pos.setRange(-36000.0, 36000.0)
+        self.sp_mit_pos.setSingleStep(1.0)
+        self.sp_mit_pos.setDecimals(2)
+        self.sp_mit_pos.setValue(0.0)
+        self.sp_mit_pos.setMinimumWidth(90)
+        self.sp_mit_pos.setToolTip(
+            "MIT 目标机械角，单位 deg，支持多圈。\n"
+            "固件内部用连续机械角 (rad)。")
+        mit_lay.addWidget(self.sp_mit_pos, 0, 1)
+
+        self.btn_mit_here = QtWidgets.QPushButton("取当前角度")
+        self.btn_mit_here.setToolTip(
+            "把 MIT 目标位置设成编码器当前机械角，\n"
+            "避免切模式/重使能时目标突然跳到 0°。")
+        self.btn_mit_here.clicked.connect(self._mit_pos_from_current)
+        mit_lay.addWidget(self.btn_mit_here, 0, 2)
+
+        mit_lay.addWidget(QtWidgets.QLabel("目标速度 (rpm):"), 1, 0)
+        self.sp_mit_vel = QtWidgets.QDoubleSpinBox()
+        self.sp_mit_vel.setRange(-3000.0, 3000.0)
+        self.sp_mit_vel.setSingleStep(10.0)
+        self.sp_mit_vel.setDecimals(0)
+        self.sp_mit_vel.setValue(0.0)
+        self.sp_mit_vel.setMinimumWidth(90)
+        self.sp_mit_vel.setToolTip(
+            "MIT 目标机械速度 (rpm)，一般给 0。\n"
+            "固件内部换算成 rad/s，作为 Kd 项的速度参考。")
+        mit_lay.addWidget(self.sp_mit_vel, 1, 1)
+
+        self.sp_mit_kp = self._gain_spin("刚度 Kp:", 0.0, 20.0, 0.01, 3, 0.50)
+        self.sp_mit_kd = self._gain_spin("阻尼 Kd:", 0.0, 2.0, 0.005, 3, 0.01)
+        self.sp_mit_ff = self._gain_spin("前馈 τff:", -1.0, 1.0, 0.005, 3, 0.0)
+        self.sp_mit_tlim = self._gain_spin("力矩限幅:", 0.0, 0.5, 0.005, 3, 0.15)
+        self.sp_mit_kp.setToolTip("刚度 Kp，单位 N·m/rad。先从 0.2 起步，越大越硬。")
+        self.sp_mit_kd.setToolTip("阻尼 Kd，单位 N·m·s/rad。太小会振荡，太大会迟钝。")
+        self.sp_mit_ff.setToolTip("前馈力矩 τff，单位 N·m。可放重力/摩擦补偿。")
+        self.sp_mit_tlim.setToolTip(
+            "力矩指令限幅，单位 N·m。\n"
+            "固件还会用电流上限和温度降流再取一次最小。")
+        mit_lay.addWidget(self.sp_mit_kp, 2, 0)
+        mit_lay.addWidget(self.sp_mit_kd, 2, 1)
+        mit_lay.addWidget(self.sp_mit_ff, 3, 0)
+        mit_lay.addWidget(self.sp_mit_tlim, 3, 1)
+
+        self.lbl_mit_hint = QtWidgets.QLabel(
+            "MIT 是力矩级控制：τ = Kp·(θd−θ) + Kd·(ωd−ω) + τff，\n"
+            "固件按 τ/Kt 转成 iq，直接送电流环，旁路转速环。\n"
+            "默认 Kp=0.5、Kd=0.01 起步；Kp 太大或 Kd 太小会振荡。")
+        self.lbl_mit_hint.setWordWrap(True)
+        self.lbl_mit_hint.setStyleSheet("color:#9fb3c8")
+        mit_lay.addWidget(self.lbl_mit_hint, 4, 0, 1, 3)
+
+        self.left_tabs.addTab(page_run, "运行")
+        self.left_tabs.addTab(self.page_mit, "MIT")
+        self.left_tabs.addTab(page_tune, "整定")
+        self.left_tabs.addTab(page_test, "测试")
+        pv.addWidget(self.left_tabs, 1)
 
         tune_lay = QtWidgets.QVBoxLayout()
         tune_lay.setSpacing(4)
         tune_lay.addLayout(row4)
         tune_lay.addLayout(row5)
 
-        pv.addWidget(self._group("控制", ctrl))
-        pv.addWidget(self._group("在线整定（电流环 / 转速环 / 位置环）", tune_lay))
+        # PI 结构切换：位置式 ↔ 增量式（电流 d/q + 转速）
+        self.chk_pi_inc = QtWidgets.QCheckBox("增量式 PI（电流 / 转速）")
+        self.chk_pi_inc.setToolTip(
+            "不勾 = 位置式：out = Kp·e + ∫Ki·e（默认）\n"
+            "勾上 = 增量式：out += Kp·(e−e_prev) + Ki·e\n"
+            "切换时会自动对齐内部状态，不会产生输出台阶。\n"
+            "用于直接对比两种结构的动态表现。")
+        tune_lay.addWidget(self.chk_pi_inc)
+
+        lay_run.addWidget(self._group("控制", ctrl))
+        lay_run.addStretch(1)
+        lay_tune.addWidget(self._group("在线整定（电流环 / 转速环 / 位置环）", tune_lay))
+        lay_tune.addStretch(1)
 
         # ================= 测试信号（固件生成正弦） =================
         test_lay = QtWidgets.QGridLayout()
@@ -808,7 +1085,8 @@ QStatusBar QLabel { color: #cfcfcf; }
         test_lay.addWidget(QtWidgets.QLabel("频率 (Hz):"), 3, 0)
         test_lay.addWidget(self.sp_sine_freq, 3, 1)
 
-        pv.addWidget(self._group("测试信号（固件生成正弦）", test_lay))
+        lay_test.addWidget(self._group("测试信号（固件生成正弦）", test_lay))
+        lay_test.addStretch(1)
 
         # ================= 曲线 =================
         self.pw_cur = pg.PlotWidget(title="三相电流 (A)")
@@ -816,7 +1094,7 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.pw_iq = pg.PlotWidget(title="iq (A)：反馈 / 目标")
         self.pw_id = pg.PlotWidget(title="id (A)：反馈 / 目标")
         self.pw_speed = pg.PlotWidget(title="转速 (rpm)")
-        self.pw_enc = pg.PlotWidget(title="编码器角度 (机械 °，连续累计)")
+        self.pw_enc = pg.PlotWidget(title="角度：机械(粉，连续累计) / 电角度(黄，-180~180)")
         self.pw_vbus = pg.PlotWidget(title="母线电压 (V)")
 
         self.curves_cur, self.curves_duty = [], []
@@ -833,6 +1111,7 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.curve_id_t = self.pw_id.plot(pen=pg.mkPen((255, 160, 80), width=1.4,
                                                       style=QtCore.Qt.DashLine), name="id 目标")
         self.curve_enc = self.pw_enc.plot(pen=pg.mkPen((255, 120, 220), width=1.4), name="角度")
+        self.curve_elec = self.pw_enc.plot(pen=pg.mkPen((255, 200, 90), width=1.2), name="电角度")
         self.curve_pos_t = self.pw_enc.plot(
             pen=pg.mkPen((120, 220, 255), width=1.4, style=QtCore.Qt.DashLine), name="位置目标")
         self.curve_vbus = self.pw_vbus.plot(pen=pg.mkPen((120, 220, 255), width=1.6))
@@ -853,14 +1132,16 @@ QStatusBar QLabel { color: #cfcfcf; }
             "speed": self.curve_speed, "speed_t": self.curve_speed_t,
             "iq": self.curve_iq, "iq_t": self.curve_iq_t,
             "id": self.curve_id, "id_t": self.curve_id_t,
-            "vbus": self.curve_vbus, "enc_deg": self.curve_enc, "pos_t": self.curve_pos_t,
+            "vbus": self.curve_vbus, "enc_deg": self.curve_enc,
+            "elec_deg": self.curve_elec, "pos_t": self.curve_pos_t,
         }
         self.plot_of = {
             "ia": self.pw_cur, "ib": self.pw_cur, "ic": self.pw_cur,
             "da": self.pw_duty, "db": self.pw_duty, "dc": self.pw_duty,
             "speed": self.pw_speed, "speed_t": self.pw_speed, "iq": self.pw_iq, "iq_t": self.pw_iq,
             "id": self.pw_id, "id_t": self.pw_id,
-            "vbus": self.pw_vbus, "enc_deg": self.pw_enc, "pos_t": self.pw_enc,
+            "vbus": self.pw_vbus, "enc_deg": self.pw_enc,
+            "elec_deg": self.pw_enc, "pos_t": self.pw_enc,
         }
         self.plots = {
             "cur": self.pw_cur, "duty": self.pw_duty, "iq": self.pw_iq,
@@ -943,7 +1224,8 @@ QStatusBar QLabel { color: #cfcfcf; }
         disp_lay.setSpacing(4)
         disp_lay.addLayout(row3)
         disp_lay.addLayout(row_view)
-        pv.addWidget(self._group("显示与视图", disp_lay))
+        # 放在"波形"页顶部：显示/to 视图控制和它下面的图是一回事
+        self.disp_group = self._group("显示与视图", disp_lay)
 
         # 自动缩放没勾时，纵向缩放没有意义，直接置灰
         self.chk_auto.toggled.connect(self.sp_zoom.setEnabled)
@@ -985,9 +1267,106 @@ QStatusBar QLabel { color: #cfcfcf; }
         bl.addWidget(self.pw_mag, 1)
         bl.addWidget(self.pw_phase, 1)
 
+        # ---------- FFT 页签：看电流谐波 ----------
+        fft_widget = QtWidgets.QWidget()
+        fl = QtWidgets.QVBoxLayout(fft_widget)
+        fl.setContentsMargins(8, 8, 8, 8)
+        fl.setSpacing(6)
+
+        fbar = QtWidgets.QHBoxLayout()
+        self.cb_fft_src = QtWidgets.QComboBox()
+        self.cb_fft_src.addItem("iq", "iq")
+        self.cb_fft_src.addItem("id", "id")
+        self.cb_fft_src.addItem("ia", "ia")
+        self.cb_fft_src.addItem("ib", "ib")
+        self.cb_fft_src.addItem("ic", "ic")
+        self.cb_fft_src.addItem("speed", "speed")
+        fbar.addWidget(QtWidgets.QLabel("通道:"))
+        fbar.addWidget(self.cb_fft_src)
+
+        self.sp_fft_n = QtWidgets.QSpinBox()
+        self.sp_fft_n.setRange(4, 14)          # 2^n 个采样点
+        self.sp_fft_n.setValue(12)             # 4096 点 = 4.096s @1kHz
+        fbar.addWidget(QtWidgets.QLabel("点数:"))
+        fbar.addWidget(self.sp_fft_n)
+
+        self.btn_fft = QtWidgets.QPushButton("计算 FFT")
+        self.btn_fft.clicked.connect(self.compute_fft)
+        fbar.addWidget(self.btn_fft)
+
+        self.chk_fft_cont = QtWidgets.QCheckBox("连续刷新")
+        self.chk_fft_cont.setChecked(False)
+        fbar.addWidget(self.chk_fft_cont)
+
+        self.lbl_fft = QtWidgets.QLabel(
+            "取最近 N 帧（1kHz 遥测）做 FFT。1kHz 采样上限 500Hz；"
+            "想看开关频率(20kHz)附近的谐波需要提高遥测速率。")
+        self.lbl_fft.setStyleSheet("color:#909090;")
+        fbar.addStretch(1)
+        fl.addLayout(fbar)
+        fl.addWidget(self.lbl_fft)
+
+        self.pw_fft = pg.PlotWidget(title="电流谐波（幅值）")
+        self.pw_fft.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_fft.setLabel("bottom", "频率", units="Hz")
+        self.pw_fft.setLabel("left", "幅值", units="A")
+        self.curve_fft = self.pw_fft.plot(pen=pg.mkPen((120, 220, 255), width=1.2))
+        self.curve_fft_peaks = self.pw_fft.plot(
+            pen=None, symbol="o", symbolSize=6, symbolBrush=(255, 120, 90))
+        fl.addWidget(self.pw_fft, 1)
+
+        # 边显示三个量：电机电气频率（一次谐波）、和最突出的前几个谱峰
+        self.lbl_harm = QtWidgets.QLabel("")
+        self.lbl_harm.setStyleSheet("font-family:Consolas,monospace; color:#d0d0d0;")
+        fl.addWidget(self.lbl_harm)
+
+        # 波形页：显示/视图控制 + 曲线区
+        wave_widget = QtWidgets.QWidget()
+        wl = QtWidgets.QVBoxLayout(wave_widget)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(4)
+        wl.addWidget(self.disp_group)
+        wl.addWidget(split, 1)
+
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(split, "波形")
+        self.tabs.addTab(wave_widget, "波形")
         self.tabs.addTab(bode_widget, "频响")
+        self.tabs.addTab(fft_widget, "谐波 FFT")
+
+        # ---------- 板内捕获页签 ----------
+        cap_widget = QtWidgets.QWidget()
+        cl = QtWidgets.QVBoxLayout(cap_widget)
+        cl.setContentsMargins(8, 8, 8, 8)
+        cl.setSpacing(6)
+
+        cap_bar = QtWidgets.QHBoxLayout()
+        self.btn_capture = QtWidgets.QPushButton("单次捕获（1024 点）")
+        self.btn_capture.setToolTip(
+            "在固件中断里按控制节拍记录 4 路信号，保留原始采样率：\n"
+            "电流扫频/普通：20kHz（51.2ms）\n"
+            "转速扫频：4kHz（256ms）\n"
+            "捕获期间普通遥测会暂停约 128ms。")
+        self.btn_capture.clicked.connect(self.start_capture)
+        cap_bar.addWidget(self.btn_capture)
+
+        self.lbl_capture = QtWidgets.QLabel("未捕获")
+        self.lbl_capture.setStyleSheet("font-family:Consolas,monospace; color:#cfe0f5;")
+        cap_bar.addWidget(self.lbl_capture)
+        cap_bar.addStretch(1)
+        cl.addLayout(cap_bar)
+
+        self.pw_capture = pg.PlotWidget(title="板内捕获")
+        self.pw_capture.showGrid(x=True, y=True, alpha=0.3)
+        self.pw_capture.setLabel("bottom", "时间", units="ms")
+        self.cap_curves = [
+            self.pw_capture.plot(pen=pg.mkPen((120, 220, 255), width=1.4), name="CH0 激励"),
+            self.pw_capture.plot(pen=pg.mkPen((255, 200, 80), width=1.4), name="CH1 响应"),
+            self.pw_capture.plot(pen=pg.mkPen((120, 255, 160), width=1.2), name="CH2"),
+            self.pw_capture.plot(pen=pg.mkPen((255, 130, 130), width=1.2), name="CH3"),
+        ]
+        self.pw_capture.addLegend()
+        cl.addWidget(self.pw_capture, 1)
+        self.tabs.addTab(cap_widget, "捕获")
 
         # ---------- 扫频 / 参数辨识页签 ----------
         ident_widget = QtWidgets.QWidget()
@@ -1045,6 +1424,27 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.lbl_ident = QtWidgets.QLabel("Rs --   Ld --   Lq --   J --   B --")
         self.lbl_ident.setStyleSheet("font-family:Consolas,monospace; color:#d0d0d0;")
         gl.addWidget(self.lbl_ident, 1, 0, 1, 3)
+
+        # 齿槽补偿
+        self.btn_cog = QtWidgets.QPushButton("齿槽辨识")
+        self.btn_cog.setToolTip(
+            "以 8rpm 匀速转 3 圈，按机械角建 720 点齿槽表。\n"
+            "约 22 秒，期间电机会慢速旋转。")
+        self.btn_cog.clicked.connect(self.start_cogging)
+        gl.addWidget(self.btn_cog, 2, 0)
+
+        self.chk_cog = QtWidgets.QCheckBox("齿槽补偿")
+        self.chk_cog.setToolTip("勾上后按机械角注入 iq 前馈（需要先辨识出有效表）")
+        gl.addWidget(self.chk_cog, 2, 1)
+
+        self.chk_cog_inv = QtWidgets.QCheckBox("反向")
+        self.chk_cog_inv.setToolTip("补偿符号取反。如果勾上补偿后齿槽感更强，就把这个勾上试试。")
+        gl.addWidget(self.chk_cog_inv, 2, 2)
+
+        self.lbl_cog = QtWidgets.QLabel("齿槽: 无表")
+        self.lbl_cog.setStyleSheet("font-family:Consolas,monospace; color:#d0d0d0;")
+        gl.addWidget(self.lbl_cog, 3, 0, 1, 3)
+
         il.addWidget(ig)
 
         il.addStretch(1)
@@ -1097,6 +1497,11 @@ QStatusBar QLabel { color: #cfcfcf; }
         self._last_test_freq = 0.0
         self._test_type = 0
         self._sweep_loop = 0
+        self.capture_flag = False
+        self.l_ident_flag = False
+        self.cog_learn_flag = False
+        self._capture_plotted = False
+        self._cap_fs = 20000.0
 
         self.chk_sine.toggled.connect(self._on_sine_toggled)
         self.cb_sine.currentIndexChanged.connect(self._on_sine_toggled)
@@ -1121,6 +1526,12 @@ QStatusBar QLabel { color: #cfcfcf; }
         sp.setValue(value)
         sp.setMinimumWidth(105)
         return sp
+
+    def _mit_pos_from_current(self):
+        """把 MIT 目标位置设成当前机械角，避免切模式时目标跳变。"""
+        cur_deg = self.store.enc[0]
+        if math.isfinite(cur_deg):
+            self.sp_mit_pos.setValue(cur_deg)
 
     @staticmethod
     def _group(title, layout):
@@ -1163,6 +1574,7 @@ QStatusBar QLabel { color: #cfcfcf; }
         openloop_mode = (mode == MODE_OPENLOOP)
         speed_mode = (mode == MODE_ENCODER)
         position_mode = (mode == MODE_POSITION)
+        mit_mode = (mode == MODE_MIT)
 
         # 开环强拖同时用 iq 作为幅值、rpm 作为目标转速
         iq_enabled = cur_mode or openloop_mode
@@ -1175,6 +1587,16 @@ QStatusBar QLabel { color: #cfcfcf; }
         self.sl_rpm.setEnabled(rpm_enabled)
         self.sp_pos.setEnabled(pos_enabled)
         self.sp_id.setEnabled(mode != MODE_OPENLOOP and mode != MODE_VIEW)
+
+        # MIT 参数只在 MIT 模式可编辑，切过去时自动跳到 MIT 页并取当前角度
+        for w in (self.sp_mit_pos, self.btn_mit_here, self.sp_mit_vel,
+                  self.sp_mit_kp, self.sp_mit_kd, self.sp_mit_ff, self.sp_mit_tlim):
+            w.setEnabled(mit_mode)
+
+        if mit_mode:
+            self.left_tabs.setCurrentWidget(self.page_mit)
+            self._mit_pos_from_current()
+            self.sp_mit_vel.setValue(0.0)
 
         if openloop_mode:
             self.lbl_iq.setText("强拖电压系数:")
@@ -1281,6 +1703,15 @@ QStatusBar QLabel { color: #cfcfcf; }
     def _on_sine_toggled(self, _=None):
         if self.chk_sine.isChecked():
             self._test_type = int(self.cb_sine.currentData())
+
+            # 正弦测试必须跑在闭环里：速度正弦 = 转速环，位置正弦 = 位置环。
+            # 原来只改目标不切模式，在电流模式下勾上完全没效果
+            # （速度目标写了但 Speed_Loop 根本没执行）。
+            self._set_mode(MODE_ENCODER if self._test_type == 1 else MODE_POSITION)
+
+            # 和扫频按钮一致：切模式会先断开输出防冲击，这里再重新使能。
+            if not self.btn_enable.isChecked():
+                self.btn_enable.setChecked(True)
         elif self._test_type in (1, 2):
             self._test_type = 0
 
@@ -1303,6 +1734,13 @@ QStatusBar QLabel { color: #cfcfcf; }
         self._sweep_loop = loop
         self._test_type = 0                    # 先停一下
         self._pending_sweep = loop
+
+        # 扫频结果由固件板内解调，上位机只负责收集
+        with self.store.lock:
+            self.store.sweep_pts = []
+            self.store.sweep_last_f = None
+        self.store.sweep_collect = loop in (3, 4)
+
         self.lbl_sweep.setText("扫频: 启动中…")
         QtCore.QTimer.singleShot(250, self._apply_pending_sweep)
 
@@ -1312,10 +1750,13 @@ QStatusBar QLabel { color: #cfcfcf; }
     def stop_sweep(self):
         self._test_type = 0
         self._sweep_loop = 0
+        self.store.sweep_collect = False
         self.lbl_sweep.setText("扫频: 已停止")
 
     def _start_l_test(self):
-        self._test_type = 5
+        # 用一次性标志位触发，不依赖 test_type 的变化沿
+        self._test_type = 0
+        self.l_ident_flag = True
 
     def start_rs_ident(self):
         self._test_type = 0
@@ -1330,12 +1771,48 @@ QStatusBar QLabel { color: #cfcfcf; }
     def start_l_ident(self):
         self._test_type = 0
         self._sweep_loop = 0
+        self._ident = None
         self._set_mode(MODE_CURRENT)
         self.btn_enable.setChecked(True)
         self.chk_sine.setChecked(False)
 
-        # 250ms 后再置 5，保证固件看到 0 → 5 的跳变
-        QtCore.QTimer.singleShot(250, self._start_l_test)
+        # Lq 会被反电势污染，必须先让转子停稳
+        self.sp_id.setValue(0.0)
+        self.sp_iq.setValue(0.0)
+        self._l_wait_t0 = time.monotonic()
+        self.lbl_ident.setText("Ld/Lq: 等待电机停稳…")
+        QtCore.QTimer.singleShot(300, self._l_wait_stop)
+
+    def _l_wait_stop(self):
+        spd = 0.0
+        with self.store.lock:
+            if self.store.chan["speed"]:
+                spd = float(self.store.chan["speed"][-1])
+
+        if abs(spd) > 10.0:
+            if time.monotonic() - self._l_wait_t0 < 5.0:
+                QtCore.QTimer.singleShot(200, self._l_wait_stop)
+            else:
+                self.lbl_ident.setText(f"Ld/Lq: 转速 {spd:.0f}rpm 没停住，已取消")
+            return
+
+        self.lbl_ident.setText("Ld/Lq: 正弦辨识中…")
+        QtCore.QTimer.singleShot(150, self._start_l_test)
+        QtCore.QTimer.singleShot(1800, self._update_ident_label)
+
+    def start_cogging(self):
+        if self.reader is None:
+            return
+
+        # 齿槽在转速模式下慢速学习
+        self._test_type = 0
+        self._sweep_loop = 0
+        self._set_mode(MODE_ENCODER)
+        self.sp_rpm.setValue(8.0)
+        self.btn_enable.setChecked(True)
+
+        self.cog_learn_flag = True
+        self.lbl_cog.setText("齿槽: 辨识中…（约 22 秒）")
 
     def start_jb_ident(self):
         self._test_type = 0
@@ -1383,51 +1860,109 @@ QStatusBar QLabel { color: #cfcfcf; }
 
         if ident["kind"] == "jb":
             if ident["step"] == 0:
-                # 先让电机停稳，再给 iq 加速
                 ident["step"] = 1
                 self.sp_iq.setValue(ident["iq"])
-                self.timer_ident.start(1200)
+                self.timer_ident.start(1000)
                 return
 
+            if ident["step"] == 1:
+                # ---- 加速段：J = T / α ----
+                with st.lock:
+                    spd = np.array(list(st.chan["speed"]), dtype=float)
+                    iqt = np.array(list(st.chan["iq_t"]), dtype=float)
+                    iqm = np.array(list(st.chan["iq"]), dtype=float)
+
+                n = min(len(spd), len(iqt), len(iqm), 3000)
+                self._j_value = float("nan")
+                self._b_value = float("nan")
+
+                if n > 300 and abs(ident["iq"]) > 0.05:
+                    spd = spd[-n:]
+                    iqt = iqt[-n:]
+                    iqm = iqm[-n:]
+
+                    th = abs(ident["iq"]) * 0.5
+                    mag = np.abs(iqt)
+                    above = mag > th
+                    rising = np.nonzero(above[1:] & ~above[:-1])[0] + 1
+                    idx = int(rising[-1]) if rising.size else (-1 if not above[0] else 0)
+
+                    if idx >= 0 and n - idx > 200:
+                        j0 = idx + 30
+                        j1 = min(j0 + 150, n)
+                        seg = spd[j0:j1]
+
+                        if seg.size >= 20:
+                            tseg = np.arange(seg.size) / SAMPLE_RATE_HZ
+                            slope = float(np.polyfit(tseg, seg, 1)[0])
+                            iq_avg = float(np.mean(iqm[j0:j1]))
+
+                            kt = MOTOR_KT
+                            w = 2.0 * math.pi / 60.0
+
+                            if abs(slope) > 200.0:
+                                self._j_value = kt * abs(iq_avg) / (abs(slope) * w)
+
+                # 切到惰行，用减速度反推 B
+                self.sp_iq.setValue(0.0)
+                ident["step"] = 2
+                self.timer_ident.start(700)
+                return
+
+            # ---- 惰行段：J·dω/dt = -B·ω ----
             with st.lock:
                 spd = np.array(list(st.chan["speed"]), dtype=float)
+                iqt = np.array(list(st.chan["iq_t"]), dtype=float)
 
-            if len(spd) > 300:
-                seg = spd[-1200:]
-                n0 = min(100, len(seg))
-                t0 = np.arange(n0) / SAMPLE_RATE_HZ
-                slope = float(np.polyfit(t0, seg[:n0], 1)[0])      # rpm/s
-                rpm_ss = float(np.mean(seg[-100:]))
+            n = min(len(spd), len(iqt), 3000)
 
-                kt = 1.5 * 7 * 0.0024        # N·m/A
-                iq = ident.get("iq", 0.8)
+            if n > 200 and math.isfinite(self._j_value):
+                spd = spd[-n:]
+                iqt = iqt[-n:]
 
-                # 加速度太小 / 没转起来就判无效
-                if abs(slope) > 50.0:
-                    self._j_value = kt * iq / (slope * (2.0 * math.pi / 60.0))
-                else:
-                    self._j_value = float("nan")
+                th = abs(ident["iq"]) * 0.1
+                busy = np.nonzero(np.abs(iqt) > th)[0]
+                last = int(busy[-1]) if busy.size else -1
 
-                if abs(rpm_ss) > 20.0:
-                    self._b_value = kt * iq / (rpm_ss * (2.0 * math.pi / 60.0))
-                else:
-                    self._b_value = float("nan")
+                start = last + 50
+                end = min(start + 300, n)
 
-            self.sp_iq.setValue(0.0)
+                if last >= 0 and end - start >= 80:
+                    t = np.arange(end - start) / SAMPLE_RATE_HZ
+                    w_rad = spd[start:end] * (2.0 * math.pi / 60.0)
+                    dw = float(np.polyfit(t, w_rad, 1)[0])
+                    w_avg = float(np.mean(w_rad))
+
+                    if w_avg > 20.0 and dw < 0.0:
+                        b = -self._j_value * dw / w_avg
+
+                        if b > 0.0:
+                            self._b_value = b
+
             self._ident = None
             self._update_ident_label()
 
     def _update_ident_label(self):
+        # L 辨识读完后把测试类型清掉，否则固件会一直认为在"测试中"
+        # （磁链在线估计也会被这个状态挡住）
+        if self._test_type == 5:
+            self._test_type = 0
+
         ld = self.store.ld_x10 / 10.0
         lq = self.store.lq_x10 / 10.0
 
         def fmt(v, unit="", digits=4):
             return "---" if not math.isfinite(v) else f"{v:.{digits}f}{unit}"
 
+        # J 量级 ~1e-5 kg·m²，B 量级 ~1e-5 N·m·s/rad，
+        # 直接按 SI 保留 3~4 位小数只会显示 0.000，这里换常用单位。
+        j_txt = "---" if not math.isfinite(self._j_value) else f"{self._j_value * 1e7:.1f} g·cm²"
+        b_txt = "---" if not math.isfinite(self._b_value) else f"{self._b_value * 1e3:.3f} mN·m·s"
+
         self.lbl_ident.setText(
             f"Rs {fmt(self._rs_value, 'Ω')}   "
             f"Ld {ld:.1f}µH   Lq {lq:.1f}µH   "
-            f"J {fmt(self._j_value, '', 3)}   B {fmt(self._b_value, '', 4)}")
+            f"J {j_txt}   B {b_txt}")
 
     def compute_bode(self):
         """扫频结束后，按 test_freq 分段做单频拟合，画伯德图"""
@@ -1437,6 +1972,20 @@ QStatusBar QLabel { color: #cfcfcf; }
                 return
 
             loop = self._sweep_loop
+
+            if loop in (3, 4):
+                # 扫频由固件在中断里生成激励并做 I/Q 解调，
+                # 每个频点的 幅值(dB)/相位(°) 通过 vd/vq 字段回传。
+                pts = list(self.store.sweep_pts)
+                self.store.sweep_collect = False
+
+                if len(pts) >= 2:
+                    pts.sort(key=lambda p: p[0])
+                    fr = np.array([p[0] for p in pts], dtype=float)
+                    self.curve_mag.setData(fr, np.array([p[1] for p in pts], dtype=float))
+                    self.curve_phase.setData(fr, np.array([p[2] for p in pts], dtype=float))
+                    self.tabs.setCurrentIndex(1)
+                    return
 
             if loop == 3:
                 x = np.array(list(self.store.chan["iq_t"]), dtype=float)
@@ -1534,6 +2083,29 @@ QStatusBar QLabel { color: #cfcfcf; }
         else:
             speed_kp = speed_ki = pos_kp = pos_kd = 0.0
 
+        # PI 结构：勾上 = 增量式，不勾 = 位置式
+        if self.chk_pi_inc.isChecked():
+            flags |= FLAG_PI_INCREMENTAL
+
+        # 板内捕获：只发一帧（固件按上升沿触发）
+        if self.capture_flag:
+            flags |= FLAG_CAPTURE
+            self.capture_flag = False
+
+        # Ld/Lq 辨识：只发一帧
+        if getattr(self, "l_ident_flag", False):
+            flags |= FLAG_L_IDENT
+            self.l_ident_flag = False
+
+        # 齿槽：建表只发一帧；补偿使能是电平
+        if getattr(self, "cog_learn_flag", False):
+            flags |= FLAG_COG_LEARN
+            self.cog_learn_flag = False
+        if self.chk_cog.isChecked():
+            flags |= FLAG_COG_ENABLE
+        if getattr(self, "chk_cog_inv", None) is not None and self.chk_cog_inv.isChecked():
+            flags |= FLAG_COG_INVERT
+
         # 测试信号：正弦 / 扫频 / L 辨识 由 _test_type 统一决定
         test_type = int(self._test_type)
         test_amp = 0.0
@@ -1545,15 +2117,35 @@ QStatusBar QLabel { color: #cfcfcf; }
         elif test_type in (3, 4):
             test_amp = self.sp_sweep_amp.value()
             test_freq = 0.0
+        elif test_type == 5:
+            # Ld/Lq 电压阶跃辨识：不需要幅值/频率
+            test_amp = 0.0
+            test_freq = 0.0
         else:
             test_type = 0
+
+        # MIT 阻抗：上位机用 deg / rpm，固件内部统一 rad / rad/s / N·m
+        if mode == MODE_MIT:
+            mit_pos_des = math.radians(self.sp_mit_pos.value())
+            mit_vel_des = self.sp_mit_vel.value() * (2.0 * math.pi / 60.0)
+            mit_kp = self.sp_mit_kp.value()
+            mit_kd = self.sp_mit_kd.value()
+            mit_tau_ff = self.sp_mit_ff.value()
+            mit_tau_limit = self.sp_mit_tlim.value()
+        else:
+            mit_pos_des = mit_vel_des = 0.0
+            mit_kp = mit_kd = mit_tau_ff = mit_tau_limit = 0.0
 
         self.reader.send(build_cmd(enable, mode, iq_ma, rpm, flags,
                                    int(round(self.sp_pos.value() * 100.0)),
                                    kp_d, ki_d, kp_q, ki_q,
                                    int(round(self.sp_id.value() * 1000.0)),
                                    speed_kp, speed_ki, pos_kp, pos_kd,
-                                   test_type, test_amp, test_freq))
+                                   test_type, test_amp, test_freq,
+                                   self.sp_plan_vmax.value(),
+                                   self.sp_plan_accel.value(),
+                                   mit_pos_des, mit_vel_des, mit_kp, mit_kd,
+                                   mit_tau_ff, mit_tau_limit))
 
     # ---------------- 显示
     def toggle_pause(self, checked):
@@ -1563,6 +2155,53 @@ QStatusBar QLabel { color: #cfcfcf; }
     def reset_view(self):
         self.sp_zoom.setValue(1.0)
         self.sp_win.setValue(0.0)
+
+    # ---------------- 板内捕获 ----------------
+    def start_capture(self):
+        if self.reader is None:
+            return
+
+        # 采样率：转速扫频按 4kHz，其余按 20kHz
+        self._cap_fs = 4000.0 if self._test_type == 4 else 20000.0
+
+        self.store.start_capture()
+        self._capture_plotted = False
+        self.capture_flag = True
+        self.lbl_capture.setText("采集中…")
+
+    def _plot_capture(self):
+        with self.store.lock:
+            data = [list(c) for c in self.store.cap]
+            total = self.store.cap_total
+            decim = max(1, self.store.cap_decim)
+            fs = max(1, self.store.cap_fs)
+
+        self._capture_plotted = True
+
+        if not data[0]:
+            self.lbl_capture.setText("捕获失败（没有收到数据）")
+            return
+
+        n = min(len(c) for c in data)
+        if n <= 1:
+            self.lbl_capture.setText("捕获失败（点数不足）")
+            return
+
+        dt = float(decim) / float(fs)
+        t = np.arange(n, dtype=np.float32) * (dt * 1000.0)
+        for i in range(4):
+            self.cap_curves[i].setData(t, np.asarray(data[i][:n], dtype=np.float32))
+
+        if self._test_type == 3:
+            names = "CH0 iq*(A) / CH1 iq(A) / CH2 id(A) / CH3 vq(V)"
+        elif self._test_type == 4:
+            names = "CH0 转速*(rpm) / CH1 转速(rpm) / CH2 iq*(A) / CH3 iq(A)"
+        else:
+            names = "CH0 iq*(A) / CH1 iq(A) / CH2 转速(rpm) / CH3 id(A)"
+
+        self.lbl_capture.setText(
+            f"已捕获 {n}/{total} 点 | {fs/1000.0:.1f}kHz / D={decim}"
+            f" → {fs/decim/1000.0:.2f}kHz | {n*dt*1000.0:.1f}ms   {names}")
 
     # ---------------- 显示控制 ----------------
     def visible_keys(self):
@@ -1597,8 +2236,17 @@ QStatusBar QLabel { color: #cfcfcf; }
         return np.concatenate([pad, out])
 
     def update_plots(self):
+        if self.store.cap_done and not self._capture_plotted:
+            self._plot_capture()
+
         if self.paused:
             return
+
+        if self.chk_fft_cont.isChecked() and self.tabs.currentIndex() == 2:
+            try:
+                self.compute_fft()
+            except Exception:
+                pass
 
         keys = self.visible_keys()
         if not keys:
@@ -1655,6 +2303,91 @@ QStatusBar QLabel { color: #cfcfcf; }
                 half = max(0.5 * (hi - lo), 1e-3) / zoom
                 pw.setYRange(mid - half, mid + half, padding=0)
 
+    def compute_fft(self):
+        """对最近 N 帧遥测做 FFT，看电流谐波。
+        1kHz 采样 → 频率分辨率 = 1000/N，上限 500Hz（Nyquist）。
+        """
+        src = self.cb_fft_src.currentData()
+        if src is None:
+            return
+
+        n_fft = 1 << self.sp_fft_n.value()       # 2^k 点
+
+        with self.store.lock:
+            chan = self.store.chan.get(src)
+            if chan is None:
+                return
+            n_avail = len(chan)
+            n_use = min(n_fft, n_avail)
+            if n_use < 64:
+                return
+            y = np.array(list(chan)[-n_use:], dtype=float)
+
+        # 去掉直流，再乘窗，可以明显减少频谱泄漏
+        y = y - float(np.mean(y))
+        if y.size & (y.size - 1):
+            # 补齐到 2 的幂
+            n_pad = 1 << int(np.ceil(np.log2(y.size)))
+            y = np.pad(y, (0, n_pad - y.size))
+            n_use = y.size
+
+        w = np.hanning(y.size)
+        spec = np.fft.rfft(y * w)
+        # 窗的能量归一化：汉宁窗相干增益 = 0.5 → 除以 (0.5·N)
+        mag = np.abs(spec) / (0.5 * y.size)
+        freqs = np.fft.rfftfreq(y.size, d=1.0 / SAMPLE_RATE_HZ)
+
+        self.curve_fft.setData(freqs, mag, skipFiniteCheck=True)
+
+        # 找出最突出的几个峰（排除 DC 附近的低频分量）
+        peak_mask = (freqs > 5.0)
+        if np.any(peak_mask):
+            fm = freqs[peak_mask]
+            mm = mag[peak_mask]
+
+            # 只取局部极大值，避免同一座峰的加窗旁瓣占满前几名
+            peaks = []
+            for i in range(1, len(mm) - 1):
+                if mm[i] >= mm[i - 1] and mm[i] > mm[i + 1] and mm[i] > 1e-3:
+                    peaks.append((float(fm[i]), float(mm[i])))
+
+            # 按幅值排序，同频段 10Hz 内只留最大
+            peaks.sort(key=lambda p: -p[1])
+            top = []
+            for fr, m in peaks:
+                if all(abs(fr - f0) > 10.0 for f0, _ in top):
+                    top.append((fr, m))
+                if len(top) >= 6:
+                    break
+            top.sort()
+            pf = [p[0] for p in top]
+            pm = [p[1] for p in top]
+            self.curve_fft_peaks.setData(pf, pm)
+
+            # 电机电频率由当前转速推：7 对极 -> fe = rpm·p/60
+            try:
+                with self.store.lock:
+                    c = self.store.chan
+                    spd = float(c["speed"][-1]) if c["speed"] else 0.0
+            except Exception:
+                spd = 0.0
+            fe = abs(spd) * 7.0 / 60.0
+
+            txt = []
+            if fe > 0.5:
+                txt.append(f"电频率 {fe:.1f}Hz（{spd:.0f}rpm × 7极对）")
+
+            for fr, m in top:
+                if fe > 0.5:
+                    k = fr / fe
+                    txt.append(f"{fr:7.1f}Hz  {m:.3f}A  ({k:.2f} 次)")
+                else:
+                    txt.append(f"{fr:7.1f}Hz  {m:.3f}A")
+
+            self.lbl_harm.setText("\n".join(txt))
+        else:
+            self.lbl_harm.setText("")
+
     def update_stats(self):
         if self.reader is None:
             return
@@ -1665,6 +2398,24 @@ QStatusBar QLabel { color: #cfcfcf; }
         fps = (frames - self._last_frames) / dt if dt > 0 else 0
         self._last_frames = frames
         self._last_time = now
+
+        psi = self.store.psi_mwb
+        PSI_STATE = {1: "未使能", 2: "测试中", 3: "无编码器",
+                     4: "低速", 5: "电流小", 6: "电压饱和", 7: "超范围"}
+        suffix = PSI_STATE.get(getattr(self.store, "psi_state", 0), "")
+        if 0.01 < psi < 100.0:
+            self.lbl_psi.setText(f"ψf {psi:.2f}mWb {suffix}".strip())
+        else:
+            self.lbl_psi.setText("ψf --.-mWb")
+
+        cs = getattr(self.store, "cog_state", 0)
+        if cs & 2:
+            cog_txt = "辨识中"
+        elif cs & 1:
+            cog_txt = "已建表" + ("/开" if (cs & 4) else "/关")
+        else:
+            cog_txt = "无表"
+        self.lbl_cog.setText(f"齿槽: {cog_txt}")
 
         mode_txt = self.cb_mode.currentText()
         fw_mode = (status >> 12) & 0x07
@@ -1694,7 +2445,7 @@ QStatusBar QLabel { color: #cfcfcf; }
         if frames == 0 and (now - self._connected_at) > 2.0:
             if self.store.rx_bytes == 0:
                 self.lbl_status.setText(
-                    "已连接但一个字节都没收到：固件没跑起来 / 选错 COM / 波特率不是 4000000"
+                    "已连接但一个字节都没收到：固件没跑起来 / 选错 COM / 波特率不是 2000000"
                 )
             else:
                 typ, ln = self.store.proto
@@ -1729,13 +2480,32 @@ QStatusBar QLabel { color: #cfcfcf; }
 
         spd_label = "设定" if (status & 0x02) else "转速"
 
+        # 温度显示：-100 是 NTC 异常哨兵
+        mt = self.store.motor_temp
+        dt_ = self.store.driver_temp
+        mt_txt = "NTC?" if mt <= -100 else f"{mt:.0f}°C"
+        dt_txt = "NTC?" if dt_ <= -100 else f"{dt_:.0f}°C"
+        therm_txt = {0: "", 1: " ⚠降流", 2: " ⛔过温停机"}.get(self.store.thermal_state, "")
+        therm_style = {0: "#d0d0d0", 1: "#ffa500", 2: "#ff5050"}.get(self.store.thermal_state, "#d0d0d0")
+
+        self.lbl_temp.setText(f"电机 {mt_txt}  驱动 {dt_txt}  状态{self.store.thermal_state}{therm_txt}")
+        self.lbl_temp.setStyleSheet(f"font-family:Consolas,monospace; color:{therm_style};")
+
+        # 电角度：由机械角推（极对数 7 + 标定零位），不用改协议
+        elec_angle_now = 0.0
+        if self.store.chan["enc_deg"]:
+            mech_last = self.store.chan["enc_deg"][-1]
+            elec_angle_now = (mech_last * 7.0 + elec_offset) % 360.0
+            if elec_angle_now > 180.0:
+                elec_angle_now -= 360.0
+
         self.lbl_stats.setText(
             f"{mode_display} | {'/'.join(flags) if flags else '未使能'} | {stage_txt} | "
             f"raw {raw[0]}/{raw[1]}/{raw[2]} | off {offs[0]}/{offs[1]}/{offs[2]} | "
             f"iq {iq_now:5.2f}/{iq_t:5.2f}  id {id_now:5.2f}/{id_t:5.2f} | "
             f"{spd_label} {spd:5.0f}/{spd_t:5.0f}rpm | "
             f"角度 {enc[0]:8.1f}°({enc[0]/360.0:+.2f}圈)/{enc[1]:4.0f}rpm(坏帧{enc[2]}) | "
-            f"offset {elec_offset:+6.2f}° | {v:5.1f}V | "
+            f"电角 {elec_angle_now:+7.1f}° | offset {elec_offset:+6.2f}° | {v:5.1f}V | "
             f"PI {pi[0]:.2f}/{pi[1]:.0f}/{pi[2]:.2f}/{pi[3]:.0f} | 丢帧 {lost}"
         )
 
@@ -1780,7 +2550,8 @@ def self_test():
                               123.4, 56, 0, 0x123456, 12.34,
                               0.235, 1162.0, 0.397, 1162.0,
                               1993, 2052, 2107, 0.42, 0.0,
-                              0.0682, 1.35, 80.0, 0.0, 500.0, 90.0, 50.0, 0.12, 0.0, 745, 425)
+                              0.0682, 1.35, 80.0, 0.0, 500.0, 90.0, 50.0, 0.12, 0.0, 745, 425,
+                              -100, -100, 0, 0, 4.18, 0)
         body = bytes((TYPE_SCOPE, len(payload))) + payload
         chk = 0
         for b in body:
@@ -1830,6 +2601,15 @@ def self_test():
     assert s[4] == (FLAG_TUNE_SPEED_PI | FLAG_TUNE_POS_PI), s
     assert abs(s[11] - 0.07) < 1e-6 and abs(s[12] - 1.5) < 1e-5, s
     assert abs(s[13] - 90.0) < 1e-4 and abs(s[14]) < 1e-6, s
+
+    mit_cmd = build_cmd(1, MODE_MIT, 0, 0, 0, 0,
+                        mit_pos_des=0.1, mit_vel_des=-0.2,
+                        mit_kp=0.5, mit_kd=0.02, mit_tau_ff=0.01,
+                        mit_tau_limit=0.15)
+    m = struct.unpack(CMD_FMT, mit_cmd[4:-1])
+    assert len(mit_cmd) == 4 + CMD_PAYLOAD + 1
+    assert abs(m[-6] - 0.1) < 1e-6 and abs(m[-5] + 0.2) < 1e-6, m
+    assert abs(m[-4] - 0.5) < 1e-6 and abs(m[-1] - 0.15) < 1e-6, m
 
     print("协议自检通过：", frames)
 

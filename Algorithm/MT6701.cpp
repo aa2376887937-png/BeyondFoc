@@ -75,6 +75,12 @@ namespace mt6701
 		pll_ki = wn * wn;
 	}
 
+	void Sensor::Set_Speed_Lpf_Hz(float hz_)
+	{
+		// 预先算成时间常数，帧中断里只剩一次除法
+		lpf_tau = (hz_ > 0.0f) ? (1.0f / (foc_math::TWO_PI * hz_)) : 0.0f;
+	}
+
 	void Sensor::Set_Electrical_Offset(float offset_rad_)
 	{
 		elec_offset = foc_math::Norm_Angle(offset_rad_);
@@ -112,6 +118,8 @@ namespace mt6701
 		elec_angle_raw = 0.0f;
 		angle = 0.0f;
 		speed = 0.0f;
+		speed_raw = 0.0f;
+		speed_lpf = 0.0f;
 		reject_cnt = 0;
 		last_implied = 0.0f;
 		has_implied = false;
@@ -194,6 +202,8 @@ namespace mt6701
 			angle_seq = angle_seq + 1u;			// 奇数：角度正在更新
 			angle = foc_math::Norm_Angle(elec_angle_raw + elec_offset);
 			speed = 0.0f;
+			speed_raw = 0.0f;
+			speed_lpf = 0.0f;
 
 			// PLL 也从当前角度起步
 			pll_theta = foc_math::Norm_Angle(direction * ((float)raw_angle * (foc_math::TWO_PI / ENCODER_CPR)));
@@ -221,7 +231,9 @@ namespace mt6701
 		// 用相邻帧的真实时间戳算 dt（无符号减法天然安全）
 		float dt_s = (float)(frame_.cycles - last_cycles) / (float)clock_hz;
 
-		if (dt_s <= 0.0f || dt_s > 0.1f) dt_s = 0.001f;
+		// 兜底：异常时按监控任务周期（250µs）算，不要用 1ms——
+		// PLL 的积分和角度推进都乘 dt，兜底值大 4 倍会直接产生速度尖峰
+		if (dt_s <= 0.0f || dt_s > 0.1f) dt_s = 0.00025f;
 
 		/*----------------------------------------------------------------------
 		 * 帧可信度检查
@@ -295,23 +307,57 @@ namespace mt6701
 		angle_seq = angle_seq + 1u;
 		angle = foc_math::Norm_Angle(elec_angle_raw + elec_offset);
 
-		// ---- 速度锁相环（二阶）：用机械角闭环估计速度 ----
-		// 相位误差 -> PI 环路滤波 -> 积分得到估计角。
-		// pll_omega 是机械 rad/s，乘极对数后作为电角速度给上层。
+		// ---- 速度来源：PLL 或 差分 + 二阶巴特沃斯（二选一，不叠加） ----
+		if (use_pll)
 		{
+			// 相位误差 -> PI 环路滤波 -> 积分得到估计角。
 			const float theta_enc = foc_math::Norm_Angle(direction * mech_angle);
 			const float e = foc_math::Norm_Angle(theta_enc - pll_theta);
 
 			pll_integral += pll_ki * e * dt_s;
 
-			// 积分限幅，防止起动/大误差时速度估计冲飞（±200rad/s ≈ ±1900rpm）
-			if (pll_integral > 200.0f) pll_integral = 200.0f;
-			else if (pll_integral < -200.0f) pll_integral = -200.0f;
+			// 积分限幅，防止起动/大误差时速度估计冲飞。
+			// 注意：匀速时 pll_omega ≈ pll_integral，所以这个限幅就是
+			// PLL 能跟踪的最高机械转速。±900rad/s ≈ ±8600rpm。
+			constexpr float kPllIntegralLimit = 900.0f;
+			if (pll_integral > kPllIntegralLimit) pll_integral = kPllIntegralLimit;
+			else if (pll_integral < -kPllIntegralLimit) pll_integral = -kPllIntegralLimit;
 
 			pll_omega = pll_kp * e + pll_integral;
 			pll_theta = foc_math::Norm_Angle(pll_theta + pll_omega * dt_s);
 
-			speed = pll_omega * (float)pole_pairs;
+			speed_raw = pll_omega * (float)pole_pairs;
+
+			// PLL 输出一阶低通。dt_s 是真实帧间隔，所以换采样率不用改系数；
+			// 角度外推仍用 speed_raw，避免滤波滞后二次叠加到预测角上。
+			if (lpf_tau > 0.0f)
+			{
+				const float a = dt_s / (lpf_tau + dt_s);
+				speed_lpf += a * (speed_raw - speed_lpf);
+				speed = speed_lpf;
+			}
+			else
+			{
+				speed_lpf = speed_raw;
+				speed = speed_raw;
+			}
+		}
+		else
+		{
+			const float mech_speed = direction * (float)delta * (foc_math::TWO_PI / ENCODER_CPR) / dt_s;
+			const float x = mech_speed * (float)pole_pairs;
+			const float y = sp_b0 * x + sp_b1 * sp_x1 + sp_b2 * sp_x2
+							- sp_a1 * sp_y1 - sp_a2 * sp_y2;
+
+			sp_x2 = sp_x1;
+			sp_x1 = x;
+			sp_y2 = sp_y1;
+			sp_y1 = y;
+
+			// 差分源已经有二阶巴特沃斯，不再串一级
+			speed_raw = y;
+			speed_lpf = y;
+			speed = y;
 		}
 
 		angle_cycles = frame_.cycles;
@@ -330,7 +376,7 @@ namespace mt6701
 	 * 这里只做一次乘加，不解析帧、不碰 SPI/CRC。dt 用帧自带的 DWT 时间戳算，
 	 * 所以连"监控任务消费之前的那段延迟"也一起补上了。
 	 *------------------------------------------------------------------------------*/
-	float Sensor::Get_Predicted_Angle(uint32_t now_cycles) const
+	float Sensor::Get_Predicted_Angle(uint32_t now_cycles, float extra_ahead_s) const
 	{
 		for (int i = 0; i < 2; i++)
 		{
@@ -338,7 +384,7 @@ namespace mt6701
 			if ((s0 & 1u) != 0u) continue;		// 正在更新，重试一次
 
 			const float a = angle;
-			const float w = speed;
+			const float w = speed_raw;		// 外推用未滤波速度，避免滤波滞后
 			const uint32_t c = angle_cycles;
 
 			if (angle_seq == s0)
@@ -347,6 +393,10 @@ namespace mt6701
 
 				// 监控任务被卡住时不要外推太远
 				if (dt > 0.002f) dt = 0.002f;
+
+				// 电压实际在下一个 PWM 周期才作用到绕组（影子寄存器），
+				// 把这一段也算进去，否则高转速下 dq 轴会有固定偏差
+				if (extra_ahead_s > 0.0f) dt += extra_ahead_s;
 
 				// 不要在中断里调 Norm_Angle（内部是 fmodf，Debug 下几微秒）。
 				// dt 已经限到 2ms，最多偏两圈，两次加减就够；

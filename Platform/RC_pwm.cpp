@@ -17,23 +17,27 @@ namespace pwm
 		uint32_t pclk2 = HAL_RCC_GetPCLK2Freq();
 		tim_clk = (pclk2 == HAL_RCC_GetHCLKFreq()) ? (float)pclk2 : (float)(pclk2 * 2);
 
-		// 使能比较值预装载（影子寄存器）：CCR 写入后在下一个更新事件统一生效，
-		// 三相同步切换，不会出现"半拍"导致波形畸变
-		htim->Instance->CCMR1 |= TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE;
-		htim->Instance->CCMR2 |= TIM_CCMR2_OC3PE;
+		// 关闭比较值预装载（影子寄存器）：CCR 写入立即生效，不等到下一个 UEV。
+		// 中央对齐模式下这样会有"半拍"风险（三相 CCR 在 CNT 上下行中途跳变），
+		// 但换来的是采样→计算→PWM 的延迟少整整一个周期（50µs→0）。
+		// 三相都在同一个 20kHz 中断里背靠背写入，实际写入间隔 <1µs，
+		// 半拍窗口很小；电流环闭环会吸收这一点差异。
+		htim->Instance->CCMR1 &= ~(TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE);
+		htim->Instance->CCMR2 &= ~TIM_CCMR2_OC3PE;
 
-		// CH4 不接引脚。当前 FOC 用"TIM1 更新中断 + 软件启动 ADC1 注入组"
-		// （和参考框架一致），CH4 / TRGO=OC4REF 只作为备用的硬件触发源保留：
-		// 如果实测发现软件启动的采样点跑出低边导通窗口，可以把 ADC1 注入组改成
-		// 硬件触发，并把这里的 Pulse 微调到这个窗口的中间。
+		// CH4 不接引脚。硬件触发源：TRGO=OC4REF，ADC1 注入组由它直接触发。
 		//
-		// 采样点必须落在"零矢量窗口"：CNT 接近 0 时三个下管全开，低边采样电阻
-		// 才能测到相电流；CNT 接近 ARR 时三个上管全开，测不到。
-		// 死区/换相尖峰也在 CNT=0 附近，必要时把触发点往后挪一点。
-		// 电流环每个 ADC 周期执行一次，dt = 1 / 20kHz = 50us。
+		// 时序（中央对齐 PWM2）：
+		//   CNT=0   → UEV，三相低边全开（零矢量窗口中心）
+		//   CNT=CCR4 上行 → OC4REF 跳变 → TRGO → ADC 注入组启动
+		// CCR4 = ARR×5% → 采样点在 CNT=0 后约 1.2µs，落在零矢量窗口内、
+		// 且避开了 CNT=0 附近的死区/换相尖峰。
+		// 必要时微调 Pulse：往后挪 = 躲尖峰，往前挪 = 贴近窗口中心。
+		// 注意大占空比时窗口变窄（三相低边导通时间 < 采样时间会采错相），
+		// 需要配最小占空比限制（过调制已在 0.95 封顶）。
 		TIM_OC_InitTypeDef sConfigOC4 = {0};
 		sConfigOC4.OCMode = TIM_OCMODE_PWM2;
-		sConfigOC4.Pulse = (uint32_t)(period * 0.02f);
+		sConfigOC4.Pulse = (uint32_t)(period * 0.05f);
 		sConfigOC4.OCPolarity = TIM_OCPOLARITY_HIGH;
 		sConfigOC4.OCFastMode = TIM_OCFAST_DISABLE;
 		if (HAL_TIM_PWM_ConfigChannel(htim, &sConfigOC4, TIM_CHANNEL_4) != HAL_OK) Error_Handler();

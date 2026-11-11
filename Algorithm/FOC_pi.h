@@ -20,10 +20,38 @@ public:
 	void Set_Integral_Separation(float error_band_);	// |误差| > 该值时暂停积分（0=关闭）
 	void Reset();								// 清积分项
 
+	// 位置式 / 增量式切换（调试对比用）
+	//   false = 位置式：out = Kp·e + ∫Ki·e        （默认）
+	//   true  = 增量式：out += Kp·(e−e_prev) + Ki·e
+	// 切换时会把状态对齐到当前输出，做到无扰切换。
+	void Set_Incremental(bool on_);
+	bool Is_Incremental() const { return incremental; }
+
 	float Process(float error, float dt);		// 一个控制周期，梯形积分 + 抗饱和
 	float Get_Integral() const { return integral; }
 	float Get_Kp() const { return kp; }
 	float Get_Ki() const { return ki; }
+
+	// 反算抗积分饱和（back-calculation）：
+	// 限幅发生在 Process 之外（电压圆），把 v_sat − v_pi 喂回来，
+	// 积分按 (Kb/Ki)·Δv 回退，与 dt 无关。
+	void Back_Calc(float sat_diff, float dt_)
+	{
+		(void)dt_;
+		constexpr float kBack = 0.5f;
+
+		if (sat_diff == 0.0f) return;
+
+		if (incremental)
+		{
+			// 增量式的状态就是输出本身，直接回退输出
+			out_prev += kBack * sat_diff;
+		}
+		else
+		{
+			integral += (kBack / (ki + 1.0e-6f)) * sat_diff;
+		}
+	}
 
 	// 按带宽整定电流环参数（零极点对消）：
 	//     kp = ω * L，ki = ω * R
@@ -39,6 +67,8 @@ private:
 	float int_min = -1e30f;		// 积分项自己的限幅
 	float int_max = 1e30f;
 	float int_sep = 0.0f;		// 积分分离阈值（0=关闭）
+	bool incremental = false;	// false=位置式 true=增量式（调试用）
+	float out_prev = 0.0f;		// 增量式的输出状态 / 位置式的上一拍输出
 };
 
 /*------------------------------------------------------------------------------
@@ -72,6 +102,25 @@ inline __attribute__((always_inline)) float Pi_Controller::Process(float error, 
 	}
 
 	const float delta = ki * 0.5f * dt * (error + prev_error) * int_weight;
+
+	// ---- 增量式：out += Kp·Δe + Ki·∫e ----
+	// 状态是输出本身，限幅直接就抗饱和；积分项是增量，天然不会累积过头。
+	if (incremental)
+	{
+		const float du = kp * (error - prev_error) + delta;
+
+		float out = out_prev + du;
+
+		if (out > out_max) out = out_max;
+		else if (out < out_min) out = out_min;
+
+		out_prev = out;
+		prev_error = error;
+
+		return out;
+	}
+
+	// ---- 位置式 ----
 	const float new_integral = integral + delta;
 
 	float out = kp * error + new_integral;
@@ -100,6 +149,7 @@ inline __attribute__((always_inline)) float Pi_Controller::Process(float error, 
 	if (integral > i_hi) integral = i_hi;
 	else if (integral < i_lo) integral = i_lo;
 
+	out_prev = out;
 	prev_error = error;
 
 	return out;

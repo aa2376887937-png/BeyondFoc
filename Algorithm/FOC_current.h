@@ -84,7 +84,7 @@ namespace foc_current
 		float cal_sum_c = 0.0f;
 
 		// 3 点中值滤波：单点采样毛刺直接吃掉，额外延迟只有 1 个采样周期
-		float hist[3][3] = {};
+		float hist[3][3] = {};			// 保留：遥测/诊断侧可复用
 		uint8_t hist_idx = 0;
 		uint8_t hist_n = 0;
 	};

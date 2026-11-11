@@ -3,6 +3,7 @@
 #include "RC_uart.h"
 #include "Framework/latest.h"
 #include "app_messages.h"
+#include "capture.h"
 
 /*==============================================================================
  * 遥测（应用层）
@@ -22,7 +23,8 @@ namespace app
 				  const framework::Latest<ControlSnapshot> &control_,
 				  const framework::Latest<EncoderSnapshot> &encoder_,
 				  const framework::Latest<PowerSnapshot> &power_,
-				  const SystemState &state_);
+				  const SystemState &state_,
+				  CaptureBuffer &capture_);
 
 		virtual ~Telemetry() {}
 
@@ -34,6 +36,8 @@ namespace app
 		const framework::Latest<EncoderSnapshot> &encoder;
 		const framework::Latest<PowerSnapshot> &power;
 		const SystemState &state;
+		CaptureBuffer &capture;
+		uint16_t cap_seq = 0;			// 捕获分块发送序号
 
 		// 上一次成功读到的编码器快照。Latest 读失败时沿用它，
 		// 避免把默认构造的 0 角度发到上位机。

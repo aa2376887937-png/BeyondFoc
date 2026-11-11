@@ -77,15 +77,18 @@ namespace app
 		// 控制器参数（双闭环）
 		controller.Set_Motor_Params(config::kMotorR, config::kMotorLd, config::kMotorLq, config::kMotorFlux);
 		controller.Set_Pole_Pairs(pole_pairs);
+		controller.Set_Kt_Scale(config::kKtScale);
 
 		// 和 Runtime 构造函数里的初始化保持一致
 		controller.Set_Speed_Pi(config::kSpeedPiKp, config::kSpeedPiKi, config::kSpeedPiLimit);
 		controller.Set_Speed_Integral_Limit(config::kSpeedPiIntegralLimit);
 		controller.Set_Speed_Integral_Separation(config::kSpeedPiIntegralSeparation);
 		controller.Set_Voltage_Limit(0.95f, 1.0f);
+		controller.Set_Iq_Limit(config::kIqLimit);
 		controller.Set_Decoupling(Foc_Controller::DECOUPLING_CROSS_BEMF);
 		controller.Set_Pwm_Freq(pwm.Get_Freq());
 		controller.Set_Dead_Time_Comp(config::kDeadTimeUs, config::kDeadTimeCompEnable);
+		controller.Set_Dead_Time_Volt(config::kDtCompDrop, config::kDtCompKnee, config::kDtCompSign);
 
 		// 位置环是 PD，Kp/Kd 已在成员默认值里从 config 初始化
 
@@ -158,7 +161,9 @@ namespace app
 			smo.Set_Pll_Gain(300.0f, 30000.0f);
 		}
 
-		// ADC1 注入组不在这里启动：由 TIM1 更新中断软件启动
+		// ADC1 注入组启动一次：硬件触发（TIM1 TRGO=OC4REF）下这次调用
+		// 只做"使能 JEOC 中断 + 等 TRGO"，每个 PWM 周期由硬件自动触发转换
+		adc.Adc_Injected_It_Start();
 	}
 
 	void ControlLoop::Set_Bus_Voltage(float v_bus_)
@@ -181,12 +186,21 @@ namespace app
 			Apply_Command(cmd);
 		}
 
-		// 2. 消费监控任务的母线电压快照
+		// 2. 消费监控任务的母线电压/温度快照
 		PowerSnapshot power;
 		if (power_in.Try_Read(power) && power.valid)
 		{
 			v_bus = power.v_bus;
+
+			// NTC 有效（开路/短路时 Ntc_To_Temp 返回 -273）才更新
+			if (power.motor_temp > -100.0f) motor_temp_latched = power.motor_temp;
+			if (power.driver_temp > -100.0f) driver_temp_latched = power.driver_temp;
 		}
+
+		// 2.5 过温状态机 + Rs 温补（1kHz 足够，温度本来就是慢变量）
+		Thermal_Protect();
+		Update_Rs_Temp_Comp(false);
+		Update_Flux_Estimate();
 
 		// 3. 电角度标定中：只等转子稳定，不跑转速环
 		if (cal_active)
@@ -196,80 +210,261 @@ namespace app
 			return;
 		}
 
-		// 4. 测试信号（1kHz 生成）
-		if ((test_type == 3 || test_type == 4) && sweep_point < config::kSweepPoints)
+		// 4. 测试信号
+		if (test_type == 3 || test_type == 4)
 		{
-			// ---- 扫频：对数步进，每个频点停留 kSweepCyclesPerPoint 个周期 ----
-			test_phase += foc_math::TWO_PI * sweep_freq * dt_task;
-
-			if (test_phase >= foc_math::TWO_PI)
-			{
-				test_phase -= foc_math::TWO_PI;
-
-				if (++sweep_cycles >= config::kSweepCyclesPerPoint)
-				{
-					sweep_cycles = 0;
-					sweep_point++;
-
-					if (sweep_point < config::kSweepPoints)
-					{
-						const float f0 = (test_type == 3) ? config::kSweepCurrentFStart : config::kSweepSpeedFStart;
-						const float f1 = (test_type == 3) ? config::kSweepCurrentFEnd : config::kSweepSpeedFEnd;
-						const float t = (float)sweep_point / (float)(config::kSweepPoints - 1);
-						sweep_freq = f0 * powf(f1 / f0, t);
-					}
-				}
-			}
-
-			const float s = foc_math::Sin_Cos(test_phase).sin;
-
-			if (test_type == 3)
-			{
-				controller.Set_Target(0.0f, test_amp * s);			// 电流环：iq 注入
-			}
-			else
-			{
-				controller.Set_Speed_Target(test_center_speed + test_amp * s);
-			}
-
-			test_freq_now = sweep_freq;
-		}
-		else if ((test_type == 3 || test_type == 4) && sweep_point >= config::kSweepPoints)
-		{
-			// 扫频完成：撤掉激励，但保持 test_type 不变，
-			// 等上位机看到 test_freq_now=0 后主动下发 0，避免重复启动。
-			if (test_type == 3) controller.Set_Target(0.0f, 0.0f);
-			else controller.Set_Speed_Target(test_center_speed);
-
-			test_freq_now = 0.0f;
-		}
-		else if ((test_type == 1 || test_type == 2) && test_freq > 0.0f)
-		{
-			// ---- 固定频率正弦 ----
-			test_phase += foc_math::TWO_PI * test_freq * dt_task;
-
-			if (test_phase >= foc_math::TWO_PI) test_phase -= foc_math::TWO_PI;
-
-			const float s = foc_math::Sin_Cos(test_phase).sin;
-
-			if (test_type == 1)
-			{
-				controller.Set_Speed_Target(test_center_speed + test_amp * s);
-			}
-			else if (test_type == 2)
-			{
-				target_position_rad = test_center_pos + test_amp * (foc_math::PI / 180.0f) * s;
-			}
-
-			test_freq_now = 0.0f;
+			// 两种扫频都在中断里生成和解调（1kHz 任务给不出高频正弦），
+			// 这里只负责把当前频点报给上位机。
+			const bool sweep_on = (test_type == 3) ? sweep_isr_active : speed_sweep_active;
+			test_freq_now = sweep_on ? sweep_freq : 0.0f;
 		}
 		else
 		{
+			// 固定频率正弦（test_type 1/2）也在 4kHz 速度环节拍里生成：
+			// 1kHz 任务给速度环的是 250µs 阶梯参考，频率越高台阶越大。
+			// 这里只清上报值。
 			test_freq_now = 0.0f;
 		}
 
 		// 5. 转速环在 ADC 中断里执行，这里只发布遥测快照
 		Publish_Snapshot();
+	}
+
+	/*------------------------------------------------------------------------------
+	 * 过温状态机（1kHz 任务里跑）
+	 *
+	 *   正常 →(绕组 >80°C / 驱动 >90°C)→ 降流（80~100°C 线性降到 30%）
+	 *        →(绕组 >100°C)→ 停机
+	 *   全部带 8°C 回差，避免在阈值附近反复横跳
+	 *   NTC 开路/短路读出 -273°C，按 25°C 处理（不动作）
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Thermal_Protect()
+	{
+		const float t_mot = motor_temp_latched;
+		const float t_drv = driver_temp_latched;
+
+		// NTC 异常值兜底
+		const bool mot_ok = (t_mot > -50.0f && t_mot < 200.0f);
+		const bool drv_ok = (t_drv > -50.0f && t_drv < 200.0f);
+
+		switch (thermal_state)
+		{
+		case 0:		// 正常
+			if ((mot_ok && t_mot >= config::kMotorTempStopC + config::kTempRecoverHystC)
+				|| (drv_ok && t_drv >= config::kDriverTempStopC + config::kTempRecoverHystC))
+			{
+				thermal_state = 2;
+				Set_Output_Enable(false);
+				controller.Set_Enable(false);
+			}
+			else if (mot_ok && t_mot >= config::kMotorTempDerateC)
+			{
+				thermal_state = 1;
+			}
+			derate_ratio = 1.0f;
+			break;
+
+		case 1:		// 降流：80→100°C 线性压到 30%
+			{
+				const float span = config::kMotorTempStopC - config::kMotorTempDerateC;
+				const float over = (mot_ok ? t_mot : 25.0f) - config::kMotorTempDerateC;
+				float r = 1.0f - (over / span) * (1.0f - config::kTempDerateMinRatio);
+
+				if (r > 1.0f) r = 1.0f;
+				if (r < config::kTempDerateMinRatio) r = config::kTempDerateMinRatio;
+
+				derate_ratio = r;
+
+				if (!mot_ok || t_mot >= config::kMotorTempStopC
+					|| (drv_ok && t_drv >= config::kDriverTempStopC))
+				{
+					thermal_state = 2;
+					Set_Output_Enable(false);
+					controller.Set_Enable(false);
+				}
+				else if (mot_ok && t_mot < config::kMotorTempDerateC - config::kTempRecoverHystC)
+				{
+					thermal_state = 0;
+					derate_ratio = 1.0f;
+				}
+			}
+			break;
+
+		case 2:		// 停机：等温度降下来，上位机命令会重新使能
+			derate_ratio = config::kTempDerateMinRatio;
+
+			if ((!mot_ok || t_mot < config::kMotorTempStopC - config::kTempRecoverHystC)
+				&& (!drv_ok || t_drv < config::kDriverTempStopC - config::kTempRecoverHystC))
+			{
+				thermal_state = 0;
+				derate_ratio = 1.0f;
+			}
+			break;
+		}
+
+		// 降流：把电压圆按比例缩（等效于全部电流限幅缩小）
+		controller.Set_Thermal_Derate(derate_ratio);
+	}
+
+	/*------------------------------------------------------------------------------
+	 * Rs 温度补偿：Ki = ω·Rs(T)
+	 *
+	 * 只在比例变化超过 2% 时才写 PI，避免 1kHz 里反复写同一个值。
+	 * Kp 不动（Kp=ω·L，L 随温度变化小）；写 Ki 用 Set_Kp_Ki 保持 Kp。
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Update_Rs_Temp_Comp(bool force_reset_)
+	{
+		static float r_ratio_last = 1.0f;
+
+		float t = motor_temp_latched;
+
+		if (!(t > config::kRsTempMinC && t < config::kRsTempMaxC))
+		{
+			t = config::kRsTempRefC;		// NTC 异常，退回标称
+		}
+
+		float ratio = 1.0f + config::kRsTempCoef * (t - config::kRsTempRefC);
+
+		if (ratio > config::kRsCompMaxRatio) ratio = config::kRsCompMaxRatio;
+		if (ratio < 2.0f - config::kRsCompMaxRatio) ratio = 2.0f - config::kRsCompMaxRatio;
+
+		if (force_reset_) r_ratio_last = -1.0f;
+
+		if (fabsf(ratio - r_ratio_last) < 0.02f) return;		// 变化 <2% 不动
+
+		r_ratio_last = ratio;
+
+		if (pi_tuned) return;			// 上位机在线整定时不要覆盖
+
+		const float ki_new = config::kCurrentLoopBw * config::kMotorR * ratio;
+
+		controller.Adjust_Ki_D_Only(ki_new);
+		controller.Adjust_Ki_Q_Only(ki_new);
+	}
+
+	/*------------------------------------------------------------------------------
+	 * 在线磁链辨识（方法一：q 轴稳态反电势）
+	 *
+	 *   vq = R·iq + ωe·Ld·id + ωe·ψf
+	 *   ψf = (vq − R·iq − ωe·Ld·id) / ωe
+	 *
+	 * 只在"高速、有负载、电压未饱和、没在扫频"时更新。1kHz 调用，
+	 * 结果用 1Hz 低通，所以对单个坏点不敏感。
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Update_Flux_Estimate()
+	{
+		if (!controller.Get_Enable()) { psi_state = 1; return; }
+		if (test_type != 0) { psi_state = 2; return; }	// 扫频/辨识期间工况不平稳
+		if (encoder == nullptr || position != encoder) { psi_state = 3; return; }
+
+		const float we = encoder->Get_Speed();		// 电角速度 (rad/s)
+		if (fabsf(we) < config::kFluxEstMinElecW) { psi_state = 4; return; }
+
+		const foc_math::Dq i = controller.Get_Current_Dq();
+		const foc_math::Dq v = controller.Get_Voltage_Dq();
+
+		if (fabsf(i.q) < config::kFluxEstMinIq) { psi_state = 5; return; }
+
+		// 电压圆饱和时 vq 被削顶，估出来会偏小，直接跳过
+		const float v_mag = sqrtf(v.d * v.d + v.q * v.q);
+		const float v_lim = v_bus * foc_math::ONE_BY_SQRT3 * 0.95f * derate_ratio * 0.9f;
+		if (v_mag > v_lim) { psi_state = 6; return; }
+
+		// Rs 温补：优先用双频 L 辨识时顺带测出的 R（带测量时的温度基准），
+		// 没有测过就用标称值。
+		float t = motor_temp_latched;
+		if (!(t > config::kRsTempMinC && t < config::kRsTempMaxC))
+		{
+			t = config::kRsTempRefC;
+		}
+
+		float ratio = 1.0f + config::kRsTempCoef * (t - r_ident_temp);
+		if (ratio > config::kRsCompMaxRatio) ratio = config::kRsCompMaxRatio;
+		if (ratio < 2.0f - config::kRsCompMaxRatio) ratio = 2.0f - config::kRsCompMaxRatio;
+
+		const float r = r_ident * ratio;
+
+		// 指令电压已含死区补偿，可以认为等于实际相电压
+		const float psi_raw = (v.q - r * i.q - we * config::kMotorLd * i.d) / we;
+
+		const float lo = config::kFluxEstMinRatio * config::kMotorFlux;
+		const float hi = config::kFluxEstMaxRatio * config::kMotorFlux;
+
+		if (!(psi_raw > lo && psi_raw < hi)) { psi_state = 7; return; }
+
+		psi_state = 0;
+
+		// 1Hz 一阶低通（tau 远大于 1ms，直接用小角度近似）
+		const float a = foc_math::TWO_PI * config::kFluxEstLpfHz * 0.001f;
+		psi_est += a * (psi_raw - psi_est);
+	}
+
+	/*------------------------------------------------------------------------------
+	 * MIT 阻抗：4kHz（和转速环节拍一致）
+	 *
+	 *   τ = Kp·(θd − θ) + Kd·(ωd − ω) + τff
+	 *   然后 controller.Set_Torque_Target(τ) -> iq = τ/Kt -> 20kHz 电流环
+	 *
+	 * 注意这里不经过转速环：速度环的积分会把外力当成误差吃掉，
+	 * 背驱透明性就没了。MIT 要的就是"外力直接改变位置"。
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Mit_Step(float dt)
+	{
+		if (!mit_active || encoder == nullptr || !(dt > 0.0f)) return;
+
+		const float p = encoder->Get_Mech_Angle_Rad();					// 连续机械角 (rad)
+		const float v = encoder->Get_Mech_Rpm() * (foc_math::TWO_PI / 60.0f);	// 机械角速度 (rad/s)
+
+		// 目标位置斜率限制（0 = 直接跟随上位机目标）
+		if (config::kMitPosSlewRadS > 0.0f)
+		{
+			const float step = config::kMitPosSlewRadS * dt;
+			const float err = mit_pos_des - mit_pos_slew;
+
+			if (err > step) mit_pos_slew += step;
+			else if (err < -step) mit_pos_slew -= step;
+			else mit_pos_slew = mit_pos_des;
+		}
+		else
+		{
+			mit_pos_slew = mit_pos_des;
+		}
+
+		// Kp/Kd 软启动：进模式瞬间不要从 0 直接跳到目标刚度
+		if (mit_gain_scale < 1.0f)
+		{
+			const float ramp = config::kMitGainRampMs * 0.001f;
+
+			mit_gain_scale += (ramp > 0.0f) ? (dt / ramp) : 1.0f;
+			if (mit_gain_scale > 1.0f) mit_gain_scale = 1.0f;
+		}
+
+		float perr = mit_pos_slew - p;
+		perr = foc_math::Limit_Abs(perr, config::kMitPosErrMax);
+
+		const float kp = mit_kp * mit_gain_scale;
+		const float kd = mit_kd * mit_gain_scale;
+
+		float tau = kp * perr + kd * (mit_vel_des - v) + mit_tau_ff;
+
+		// 力矩限幅：上位机给的值、电流上限、温度降流三者取最小
+		const float kt = controller.Get_Kt();
+		float tau_lim = mit_tau_limit;
+
+		if (kt > 0.0f)
+		{
+			const float tau_hw = kt * config::kIqLimit * derate_ratio;
+
+			if (tau_hw < tau_lim) tau_lim = tau_hw;
+		}
+
+		tau = foc_math::Limit_Abs(tau, tau_lim);
+
+		// 任何 NaN 都不许进电流环
+		if (!(tau == tau)) tau = 0.0f;
+
+		mit_tau_cmd = tau;
+		controller.Set_Torque_Target(tau * config::kTorqueSign);
 	}
 
 	/*------------------------------------------------------------------------------
@@ -285,6 +480,328 @@ namespace app
 	}
 
 	/*------------------------------------------------------------------------------
+	 * 扫频解调的一步：累加 -> 推进相位 -> 满一个频点就出结果并切到下一个频点
+	 *
+	 *   feedback  电流环填 iq (A)，转速环填转速 (rpm)
+	 *   dt        电流环 50µs（20kHz），转速环 250µs（4kHz）
+	 *   is_speed  true = 转速环扫频
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Sweep_Advance(float feedback, float sc_sin, float sc_cos, float dt, bool is_speed)
+	{
+		if (sweep_cycles >= config::kSweepSettleCycles)
+		{
+			sweep_i_acc += feedback * sc_sin;
+			sweep_q_acc += feedback * sc_cos;
+			sweep_acc_n++;
+		}
+
+		sweep_phase += foc_math::TWO_PI * sweep_freq * dt;
+
+		if (sweep_phase >= foc_math::TWO_PI)
+		{
+			sweep_phase -= foc_math::TWO_PI;
+			sweep_cycles++;
+		}
+
+		const uint16_t meas_cycles = is_speed ? speed_sweep_meas_cycles : sweep_meas_cycles;
+
+		if (sweep_cycles < (uint16_t)(config::kSweepSettleCycles + meas_cycles)) return;
+
+		const float n = (float)sweep_acc_n;
+		const float amp_ref = fabsf(test_amp);
+
+		if (n > 4.0f && amp_ref > 1.0e-6f)
+		{
+			const float mag = 2.0f * sqrtf(sweep_i_acc * sweep_i_acc + sweep_q_acc * sweep_q_acc) / n;
+
+			sweep_res_mag_db = 20.0f * log10f(mag / amp_ref + 1.0e-9f);
+			sweep_res_phase_deg = atan2f(sweep_q_acc, sweep_i_acc) * (180.0f / foc_math::PI);
+		}
+		else
+		{
+			sweep_res_mag_db = -120.0f;
+			sweep_res_phase_deg = 0.0f;
+		}
+
+		sweep_res_freq = sweep_freq;
+		sweep_res_valid = true;
+
+		sweep_point++;
+
+		if (sweep_point >= config::kSweepPoints)
+		{
+			if (is_speed)
+			{
+				speed_sweep_active = false;
+				controller.Set_Speed_Target(test_center_speed);
+			}
+			else
+			{
+				sweep_isr_active = false;
+				controller.Set_Target(0.0f, 0.0f);
+			}
+			return;
+		}
+
+		const float f0 = is_speed ? config::kSweepSpeedFStart : config::kSweepCurrentFStart;
+		const float f1 = is_speed ? config::kSweepSpeedFEnd : config::kSweepCurrentFEnd;
+		const float t = (float)sweep_point / (float)(config::kSweepPoints - 1);
+
+		sweep_freq = f0 * powf(f1 / f0, t);
+
+		float mc = config::kSweepMinMeasureS * sweep_freq;
+		if (mc < (float)config::kSweepSettleCycles) mc = (float)config::kSweepSettleCycles;
+
+		if (is_speed) speed_sweep_meas_cycles = (uint16_t)(mc + 0.999f);
+		else sweep_meas_cycles = (uint16_t)(mc + 0.999f);
+
+		sweep_phase = 0.0f;
+		sweep_cycles = 0;
+		sweep_i_acc = 0.0f;
+		sweep_q_acc = 0.0f;
+		sweep_acc_n = 0;
+	}
+
+	/*------------------------------------------------------------------------------
+	 * 中位数（n <= kLSineRepeat）
+	 *------------------------------------------------------------------------------*/
+	float ControlLoop::Median_Of(float *a, uint8_t n)
+	{
+		if (n == 0) return 0.0f;
+
+		for (uint8_t i = 1; i < n; i++)
+		{
+			const float v = a[i];
+			int8_t j = (int8_t)(i - 1);
+
+			while (j >= 0 && a[j] > v)
+			{
+				a[j + 1] = a[j];
+				j--;
+			}
+
+			a[j + 1] = v;
+		}
+
+		if (n & 1u) return a[n / 2];
+
+		return 0.5f * (a[n / 2 - 1] + a[n / 2]);
+	}
+
+	/*------------------------------------------------------------------------------
+	 * Ld/Lq 正弦阻抗辨识：一个控制周期的一步
+	 *
+	 *   给 d（或 q）轴注入 V = kLSineVolt·sin(ωt)，电流稳态后用同相位
+	 *   sin/cos 做 I/Q 解调，取基波幅值：
+	 *       I_amp = 2·sqrt(I²+Q²)/N，Z = V/I，L = sqrt(Z²-R²)/ω
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::L_Sine_Advance(float id, float iq, float sc_sin, float sc_cos)
+	{
+		if (l_sine_cycles >= config::kLSineSettleCycles)
+		{
+			const float fb = (l_sine_axis == 0) ? id : iq;
+
+			l_sine_i += fb * sc_sin;
+			l_sine_q += fb * sc_cos;
+			l_sine_n++;
+		}
+
+		l_sine_phase += foc_math::TWO_PI * l_sine_f * dt;
+
+		if (l_sine_phase >= foc_math::TWO_PI)
+		{
+			l_sine_phase -= foc_math::TWO_PI;
+			l_sine_cycles++;
+		}
+
+		if (l_sine_cycles < (uint16_t)(config::kLSineSettleCycles + config::kLSineMeasCycles)) return;
+
+		// 本次频点的阻抗
+		const float n = (float)l_sine_n;
+		float z = 0.0f;
+
+		if (n > 10.0f)
+		{
+			const float i_amp = 2.0f * sqrtf(l_sine_i * l_sine_i + l_sine_q * l_sine_q) / n;
+
+			if (i_amp > 0.01f) z = config::kLSineVolt / i_amp;
+		}
+
+		// 复位累加器，准备下一个频点/下一次
+		l_sine_i = 0.0f;
+		l_sine_q = 0.0f;
+		l_sine_n = 0;
+		l_sine_phase = 0.0f;
+		l_sine_cycles = 0;
+
+		// ---- 低频点测完：换到高频点，重复计数不前进 ----
+		if (l_freq_idx == 0 && z > 0.0f)
+		{
+			l_z1 = z;
+			l_freq_idx = 1;
+			l_sine_f = config::kLSineF2;
+			return;
+		}
+
+		// ---- 高频点测完：双频解出 L 和 R ----
+		if (l_freq_idx == 1)
+		{
+			const float w1 = foc_math::TWO_PI * config::kLSineF1;
+			const float w2 = foc_math::TWO_PI * config::kLSineF2;
+			const float denom = w2 * w2 - w1 * w1;
+			const float dz = z * z - l_z1 * l_z1;
+
+			float l = 0.0f;
+			float r = 0.0f;
+
+			if (denom > 0.0f && dz > 0.0f)
+			{
+				l = sqrtf(dz / denom);
+
+				// 低频点反推 R：R² = Z1² − (ω1·L)²
+				const float wl = w1 * l;
+				if (l_z1 * l_z1 > wl * wl) r = sqrtf(l_z1 * l_z1 - wl * wl);
+			}
+
+			if (l > 0.0f && l < 0.01f)
+			{
+				if (l_sine_axis == 0 && l_cnt_d < config::kLSineRepeat) l_samp_d[l_cnt_d++] = l;
+				else if (l_sine_axis == 1 && l_cnt_q < config::kLSineRepeat) l_samp_q[l_cnt_q++] = l;
+
+				// 电阻只在 d 轴记录一次（q 轴有转矩，转子可能微动）
+				if (l_sine_axis == 0 && r > 0.0f && r < 2.0f && r_cnt < config::kLSineRepeat)
+				{
+					r_samp[r_cnt++] = r;
+				}
+			}
+		}
+
+		l_freq_idx = 0;
+		l_sine_f = config::kLSineF1;
+
+		if (++l_rep < config::kLSineRepeat)
+		{
+			// 同一轴继续测
+		}
+		else if (l_sine_axis == 0)
+		{
+			l_sine_axis = 1;
+			l_rep = 0;
+		}
+		else
+		{
+			l_ld = Median_Of(l_samp_d, l_cnt_d);
+			l_lq = Median_Of(l_samp_q, l_cnt_q);
+
+			if (r_cnt > 0)
+			{
+				r_ident = Median_Of(r_samp, r_cnt);
+				r_ident_temp = motor_temp_latched;
+			}
+
+			l_state = 0;
+			controller.Set_Voltage_Override(false, 0.0f, 0.0f);
+		}
+	}
+
+	/*------------------------------------------------------------------------------
+	 * 齿槽补偿：建表 / 注入
+	 *------------------------------------------------------------------------------*/
+	void ControlLoop::Cogging_Start()
+	{
+		for (uint16_t i = 0; i < config::kCogBins; i++)
+		{
+			cog_sum[i] = 0.0f;
+			cog_cnt[i] = 0;
+			cog_table[i] = 0;
+		}
+
+		cog_valid = false;
+		cog_learning = true;
+		cog_angle_acc = 0.0f;
+		cog_last_angle = (encoder != nullptr) ? encoder->Get_Mech_Angle_Wrapped_Rad() : 0.0f;
+
+		controller.Set_Speed_Target(config::kCogLearnRpm);
+	}
+
+	void ControlLoop::Cogging_Apply()
+	{
+		float iq = 0.0f;
+
+		if (cog_enabled && cog_valid && encoder != nullptr &&
+			(speed_loop || position_loop || mode == MODE_MIT))
+		{
+			float a = encoder->Get_Mech_Angle_Wrapped_Rad();
+			if (a < 0.0f) a += foc_math::TWO_PI;
+
+			int bin = (int)(a * ((float)config::kCogBins / foc_math::TWO_PI));
+			if (bin < 0) bin = 0;
+			else if (bin >= (int)config::kCogBins) bin = (int)config::kCogBins - 1;
+
+			// 表里存的是"维持匀速所需的电流"，补偿取反；
+			// cog_invert 是调试用的反号开关
+			iq = (cog_invert ? 1.0f : -1.0f) * (float)cog_table[bin] * 0.001f;
+		}
+
+		controller.Set_Iq_Cogging(iq);
+	}
+
+	void ControlLoop::Cogging_Learn(float iq_fb)
+	{
+		if (!cog_learning || encoder == nullptr) return;
+
+		const float a = encoder->Get_Mech_Angle_Wrapped_Rad();
+
+		// 累计转过角度（绝对值），用于判圈数
+		float d = a - cog_last_angle;
+		if (d > foc_math::PI) d -= foc_math::TWO_PI;
+		else if (d < -foc_math::PI) d += foc_math::TWO_PI;
+
+		cog_angle_acc += fabsf(d);
+		cog_last_angle = a;
+
+		float an = (a < 0.0f) ? (a + foc_math::TWO_PI) : a;
+		int bin = (int)(an * ((float)config::kCogBins / foc_math::TWO_PI));
+		if (bin < 0) bin = 0;
+		else if (bin >= (int)config::kCogBins) bin = (int)config::kCogBins - 1;
+
+		cog_sum[bin] += iq_fb;
+		if (cog_cnt[bin] < 0xFFFFu) cog_cnt[bin]++;
+
+		if (cog_angle_acc >= foc_math::TWO_PI * config::kCogLearnRevs)
+		{
+			Cogging_Finish();
+		}
+	}
+
+	void ControlLoop::Cogging_Finish()
+	{
+		cog_learning = false;
+
+		float sum = 0.0f;
+		uint32_t n = 0;
+
+		for (uint16_t i = 0; i < config::kCogBins; i++)
+		{
+			sum += cog_sum[i];
+			n += cog_cnt[i];
+		}
+
+		const float mean = (n > 0u) ? (sum / (float)n) : 0.0f;
+
+		for (uint16_t i = 0; i < config::kCogBins; i++)
+		{
+			float v = (cog_cnt[i] > 0u) ? (cog_sum[i] / (float)cog_cnt[i] - mean) : 0.0f;
+
+			v = foc_math::Limit_Abs(v, config::kCogMaxA);
+			cog_table[i] = (int16_t)(v * 1000.0f);
+		}
+
+		cog_valid = true;
+		controller.Set_Speed_Target(0.0f);
+	}
+
+	/*------------------------------------------------------------------------------
 	 * 电流采样中断（20kHz）
 	 *
 	 *   这里是"电流生产者"的唯一消费者：
@@ -293,10 +810,24 @@ namespace app
 	void ControlLoop::Adc_InjectedConvCplt_Process()
 	{
 		// ADC1 注入组：rank1=IC(PA0)，rank2=IB(PA1)，rank3=IA(PA2)
+		// 先读 JDR：JEOC 已经把三通道结果锁存好了，越早读，电流值越早
+		// 进入控制运算（编码器帧消费有 CRC+PLL，约 2~3µs，放它后面会让
+		// 采样→计算的路径白白多出这段时间）。
 		foc_current::Raw raw;
 		raw.c = (uint16_t)adc.Get_Injected(ADC_INJECTED_RANK_1);
 		raw.b = (uint16_t)adc.Get_Injected(ADC_INJECTED_RANK_2);
 		raw.a = (uint16_t)adc.Get_Injected(ADC_INJECTED_RANK_3);
+
+		// 编码器帧在 20kHz 电流环中断里直接消费：速度估计最高 16kHz 更新，
+		// 比原来放在 4kHz 监控任务里快 4 倍。Monitor 只负责看门狗和快照发布。
+		if (frame_src != nullptr && encoder != nullptr)
+		{
+			encoder::Frame frame;
+			if (frame_src->Try_Take_Frame(frame))
+			{
+				encoder->Consume(frame);
+			}
+		}
 
 		// 采样和零偏累加永远按注入频率（20kHz）跑，校准/遥测的时间基准不受降频影响
 		const bool current_ready = current.Update(raw);
@@ -366,7 +897,7 @@ namespace app
 		// 监控任务 1kHz 才更新角度，直接用会有最多 1ms 的滞后，
 		// 高转速下就是几十度的 dq 失配（id<0 时会变成负阻尼）。
 		input.angle = (position == encoder)
-						? encoder->Get_Predicted_Angle(DWT->CYCCNT)
+						? encoder->Get_Predicted_Angle(DWT->CYCCNT, dt * 1.5f)	// 含影子寄存器延迟
 						: position->Get_Angle();
 		input.speed_elec = position->Get_Speed();
 		input.v_bus = v_bus;
@@ -379,28 +910,83 @@ namespace app
 
 			const bool test_sine = (test_type == 2 && test_freq > 0.0f);
 
-			// ---- 1. 轨迹：正弦测试直接用目标 + 解析微分，其它情况用 TD ----
+			// ---- 1. 轨迹：正弦测试直接给目标，其余走规划器 ----
 			float target = target_position_rad;
 
 			if (test_sine)
 			{
 				// TD 的加速度上限会削平正弦，跟踪测试必须绕开它。
+				// 目标由 test_phase 现算（相位在 4kHz 节拍里推进），
 				// 解析微分作为速度前馈：d/dt[amp·sin(ωt)] = amp·ω·cos(ωt)
+				const float amp_rad = test_amp * (foc_math::PI / 180.0f);
+				const float w = foc_math::TWO_PI * test_freq;
+				const foc_math::SinCos sc = foc_math::Sin_Cos(test_phase);
+
+				target = test_center_pos + amp_rad * sc.sin;
 				pos_td_x1 = target;
-				pos_td_x2 = test_amp * (foc_math::PI / 180.0f)
-							* (foc_math::TWO_PI * test_freq)
-							* foc_math::Sin_Cos(test_phase).cos;
+				pos_td_x2 = amp_rad * w * sc.cos;
+				// 解析二阶导：d²/dt²[amp·sin(ωt)] = -amp·ω²·sin(ωt)
+				pos_td_a = -amp_rad * w * w * sc.sin;
+			}
+			else if (config::kPositionPlanEnable)
+			{
+				/*--------------------------------------------------------------
+				 * 最速控制：bang-bang + 相位平面开关线
+				 *
+				 *   开关函数  σ = d − v·|v| / (2·a_max)
+				 *   σ > 0 → a = +a_max（还没到刹车点，继续加速）
+				 *   σ < 0 → a = −a_max（速度太快，必须减速）
+				 *   σ = 0 就是开关线  v|v| = 2·a_max·d
+				 *
+				 * 加速度永远只有 ±a_max 两态，没有中间过渡；v_max 只是
+				 * 长位移时的速度上限（短位移根本碰不到，速度曲线是三角形）。
+				 *
+				 * 离散实现下参考轨迹会在终点附近轻微越过目标，越过即落位，
+				 * 避免开关线两边来回翻。
+				 *--------------------------------------------------------------*/
+				const float d = target - pos_td_x1;
+				const float v = pos_td_x2;
+				const float a_max = plan_accel;
+
+				const float sigma = d - v * fabsf(v) / (2.0f * a_max);
+				float a_cmd = (sigma > 0.0f) ? a_max : -a_max;
+
+				// 速度上限：只对长位移的匀速段生效
+				if ((v >= plan_vmax && a_cmd > 0.0f) ||
+					(v <= -plan_vmax && a_cmd < 0.0f))
+				{
+					a_cmd = 0.0f;
+				}
+
+				pos_td_x1 += v * position_dt + 0.5f * a_cmd * position_dt * position_dt;
+				pos_td_x2 = v + a_cmd * position_dt;
+				pos_td_a = a_cmd;
+
+				if (pos_td_x2 > plan_vmax) pos_td_x2 = plan_vmax;
+				else if (pos_td_x2 < -plan_vmax) pos_td_x2 = -plan_vmax;
+
+				// 越过目标 → 落位（开关线在离散化下的终点处理）
+				const float d_after = target - pos_td_x1;
+				if ((d > 0.0f && d_after <= 0.0f) || (d < 0.0f && d_after >= 0.0f) ||
+					fabsf(d) < 1.0e-6f)
+				{
+					pos_td_x1 = target;
+					pos_td_x2 = 0.0f;
+					pos_td_a = 0.0f;
+				}
 			}
 			else if (config::kPositionTdEnable)
 			{
 				const float fh = Fhan(pos_td_x1 - target, pos_td_x2, config::kPositionTdAccel, position_dt);
 				pos_td_x1 += position_dt * pos_td_x2;
 				pos_td_x2 += position_dt * fh;
+				pos_td_a = fh;
 			}
 			else
 			{
 				pos_td_x1 = target;
 				pos_td_x2 = 0.0f;
+				pos_td_a = 0.0f;
 			}
 
 			// ---- 2. 误差 + 带回差的小死区 ----
@@ -445,6 +1031,39 @@ namespace app
 			else if (speed_ref < -config::kPositionSpeedLimit) speed_ref = -config::kPositionSpeedLimit;
 
 			controller.Set_Speed_Target(speed_ref * 60.0f / foc_math::TWO_PI);
+
+			// 加速度前馈：iq_ff = J·a / Kt（机械域，单位 A）
+			// 加速段直接给转速环预支转矩，减少位置滞后；减速段为负。
+			const float iq_ff = config::kPositionAccelFf
+								* config::kMotorJ * pos_td_a / config::kMotorKt;
+			controller.Set_Iq_Feedforward(iq_ff);
+		}
+
+		// ---- 固定频率正弦：在 4kHz 速度环节拍上生成 ----
+		// 原来由 1kHz 任务生成，速度环看到的是 250µs 阶梯参考，
+		// 频率一高台阶就明显（50Hz 时 20 点/周期），闭环会跟着抖。
+		// 相位只在这里推进（1kHz 任务不再动 test_phase），保证唯一写者。
+		if (speed_due && test_freq > 0.0f && (test_type == 1 || test_type == 2))
+		{
+			test_phase += foc_math::TWO_PI * test_freq * speed_dt;
+
+			if (test_phase >= foc_math::TWO_PI) test_phase -= foc_math::TWO_PI;
+
+			if (test_type == 1)
+			{
+				controller.Set_Speed_Target(test_center_speed + test_amp * foc_math::Sin_Cos(test_phase).sin);
+			}
+		}
+
+		// ---- 转速环扫频：4kHz 生成激励（1kHz 任务给不出 800Hz 正弦）----
+		foc_math::SinCos speed_sweep_sc = {0.0f, 0.0f};
+		const bool speed_sweep_now = (speed_due && speed_sweep_active);
+
+		if (speed_sweep_now)
+		{
+			speed_sweep_sc = foc_math::Sin_Cos(sweep_phase);
+			cap_exc_speed = test_center_speed + test_amp * speed_sweep_sc.sin;
+			controller.Set_Speed_Target(cap_exc_speed);
 		}
 
 		// 转速环 4kHz：读取 Monitor 任务更新的最新编码器速度
@@ -453,75 +1072,110 @@ namespace app
 			controller.Speed_Loop(encoder->Get_Mech_Rpm(), speed_dt);
 		}
 
-		// Ld/Lq 阶跃辨识：直接给 dq 电压，绕过电流环 PI
-		if (l_state == 1)
+		// MIT 阻抗 4kHz：力矩级控制，旁路上面的转速环。
+		// mode 是 volatile，命令任务写、ISR 读；只要 mode 还不是 MIT 就不会进。
+		if (speed_due && mode == MODE_MIT && !cal_active)
 		{
-			controller.Set_Voltage_Override(true, config::kLStepVoltD, 0.0f);
+			if (encoder != nullptr && position == encoder && encoder->Is_Valid())
+			{
+				Mit_Step(speed_dt);
+			}
+			else
+			{
+				// 编码器失效不能继续保留上一拍力矩，立即清零
+				mit_active = false;
+				controller.Set_Torque_Target(0.0f);
+			}
 		}
-		else if (l_state == 3)
+
+		if (speed_sweep_now && encoder != nullptr)
 		{
-			controller.Set_Voltage_Override(true, 0.0f, config::kLStepVoltQ);
+			Sweep_Advance(encoder->Get_Mech_Rpm(), speed_sweep_sc.sin, speed_sweep_sc.cos, speed_dt, true);
 		}
-		else if (l_state != 0)
+
+		// Ld/Lq 正弦阻抗辨识：d/q 轴注入 1kHz 正弦电压，稳态测电流幅值
+		foc_math::SinCos l_sc = {0.0f, 0.0f};
+		const bool l_now = (l_state == 1);
+
+		if (l_now)
 		{
-			controller.Set_Voltage_Override(true, 0.0f, 0.0f);
+			// 测试过程中也要盯住转子：q 轴注入会产生转矩，
+			// 一旦转起来反电势会污染 Lq 的测量
+			const float rpm_now = (encoder != nullptr) ? encoder->Get_Mech_Rpm() : 0.0f;
+
+			if (fabsf(rpm_now) > 30.0f)
+			{
+				l_state = 0;
+				controller.Set_Voltage_Override(false, 0.0f, 0.0f);
+			}
+			else
+			{
+				l_sc = foc_math::Sin_Cos(l_sine_phase);
+
+				const float v = config::kLSineVolt * l_sc.sin;
+
+				if (l_sine_axis == 0) controller.Set_Voltage_Override(true, v, 0.0f);
+				else controller.Set_Voltage_Override(true, 0.0f, v);
+			}
 		}
+
+		// ---- 电流环扫频：20kHz 生成激励 ----
+		// 1kHz 任务生成不了 1kHz 正弦（Nyquist 只有 500Hz），
+		// 所以激励和测量都放在这个 20kHz 中断里。
+		foc_math::SinCos sweep_sc = {0.0f, 0.0f};
+		const bool sweep_now = sweep_isr_active;
+
+		if (sweep_now)
+		{
+			sweep_sc = foc_math::Sin_Cos(sweep_phase);
+			cap_exc_q = test_amp * sweep_sc.sin;
+			controller.Set_Target(0.0f, cap_exc_q);
+		}
+
+		// 齿槽补偿：按当前机械角查表，叠加到 iq 指令（在 Step 之前）
+		Cogging_Apply();
 
 		const Foc_Controller::Output output = controller.Step(input);
 
 		last_mod = output.mod;
 		pwm.Set_Duty(output.duty.a, output.duty.b, output.duty.c);
 
-		// L 辨识状态机：电压施加一拍后测电流变化
-		if (l_state != 0)
+		// 齿槽学习：按位置把实际 iq 累加进对应的角度 bin
+		Cogging_Learn(output.i_dq.q);
+
+		// ---- 板内捕获：按控制节拍记录 4 路信号 ----
+		// 电流扫频/普通捕获按 20kHz，转速扫频按 4kHz（和速度环节拍一致）
+		if (capture.armed)
 		{
-			switch (l_state)
+			if (test_type == 4)
 			{
-			case 1:		// d 轴阶跃
-				if (l_tick == 0)
+				if (speed_due)
 				{
-					l_i0 = output.i_dq.d;
-					l_tick = 1;
+					const float spd = (encoder != nullptr) ? encoder->Get_Mech_Rpm() : 0.0f;
+					capture.Push(cap_exc_speed, spd, controller.Get_Iq_Target(), output.i_dq.q);
 				}
-				else
-				{
-					const float di = fabsf(output.i_dq.d - l_i0);
-					const float l = (di > 0.10f) ? (config::kLStepVoltD * dt / di) : 0.0f;
-					l_ld = (l > 0.0f && l < 0.01f) ? l : 0.0f;		// 只接受 0~10mH
-					l_state = 2;
-					l_tick = 0;
-				}
-				break;
-
-			case 2:		// 冷却，等电流衰减
-				if (++l_tick > 600)		// 30ms
-				{
-					l_state = 3;
-					l_tick = 0;
-				}
-				break;
-
-			case 3:		// q 轴阶跃
-				if (l_tick == 0)
-				{
-					l_i0 = output.i_dq.q;
-					l_tick = 1;
-				}
-				else
-				{
-					const float di = fabsf(output.i_dq.q - l_i0);
-					const float l = (di > 0.10f) ? (config::kLStepVoltQ * dt / di) : 0.0f;
-					l_lq = (l > 0.0f && l < 0.01f) ? l : 0.0f;
-					l_state = 4;
-					l_tick = 0;
-				}
-				break;
-
-			case 4:		// 结束，恢复 PI
-				controller.Set_Voltage_Override(false, 0.0f, 0.0f);
-				l_state = 0;
-				break;
 			}
+			else if (test_type == 3)
+			{
+				capture.Push(cap_exc_q, output.i_dq.q, output.i_dq.d, output.v_dq.q);
+			}
+			else
+			{
+				const float spd = (encoder != nullptr) ? encoder->Get_Mech_Rpm() : 0.0f;
+				capture.Push(controller.Get_Iq_Target(), output.i_dq.q, spd, output.i_dq.d);
+			}
+		}
+
+		// ---- 电流环扫频：与激励同相位的 I/Q 同步解调 ----
+		if (sweep_now)
+		{
+			Sweep_Advance(output.i_dq.q, sweep_sc.sin, sweep_sc.cos, dt, false);
+		}
+
+		// L 辨识：稳态 I/Q 解调
+		if (l_now)
+		{
+			L_Sine_Advance(output.i_dq.d, output.i_dq.q, l_sc.sin, l_sc.cos);
 		}
 	}
 
@@ -532,12 +1186,35 @@ namespace app
 	{
 		last_cmd_ms = HAL_GetTick();
 
-		// 测试信号参数：中心值直接取命令里的转速/位置目标
+		// 记录上一条命令的测试类型：固定频率正弦结束时要把速度目标
+		// 从"最后一个正弦值"拉回用户设定值，否则电机会停在正弦的残留转速上
+		// （20Hz 命令流里 last_speed_target 没变，不会自动重写目标）。
+		const uint8_t prev_test_type = test_type;
+
+		// 先落地幅值/中心值：ISR 里的扫频激励会立刻用到 test_amp
+		test_amp = cmd_.test_amp;
+		test_freq = cmd_.test_freq;
+		test_center_speed = cmd_.speed_rpm;
+		test_center_pos = cmd_.position_deg * (foc_math::PI / 180.0f);
+
+		// 最速规划的限幅/加速度：上位机每次下发，0 = 保持固件当前值
+		if (cmd_.plan_vmax > 0.0f)
+		{
+			plan_vmax = Clamp_Gain(cmd_.plan_vmax, 0.1f, 300.0f);
+		}
+		if (cmd_.plan_accel > 0.0f)
+		{
+			plan_accel = Clamp_Gain(cmd_.plan_accel, 1.0f, 5000.0f);
+		}
+
 		if (cmd_.test_type != test_type)
 		{
 			test_phase = 0.0f;			// 开始/切换时相位归零
 
 			// 停掉上一种测试
+			sweep_isr_active = false;
+			speed_sweep_active = false;
+
 			if (l_state != 0)
 			{
 				l_state = 0;
@@ -548,27 +1225,63 @@ namespace app
 			sweep_cycles = 0;
 			sweep_freq = 0.0f;
 
-			if (cmd_.test_type == 3)
+			if (cmd_.test_type == 3 || cmd_.test_type == 4)
 			{
-				sweep_freq = config::kSweepCurrentFStart;
-			}
-			else if (cmd_.test_type == 4)
-			{
-				sweep_freq = config::kSweepSpeedFStart;
+				const bool is_speed = (cmd_.test_type == 4);
+
+				sweep_freq = is_speed ? config::kSweepSpeedFStart : config::kSweepCurrentFStart;
+				sweep_phase = 0.0f;
+				sweep_cycles = 0;
+				sweep_i_acc = 0.0f;
+				sweep_q_acc = 0.0f;
+				sweep_acc_n = 0;
+				sweep_res_valid = false;
+				sweep_res_freq = 0.0f;
+				sweep_res_mag_db = 0.0f;
+				sweep_res_phase_deg = 0.0f;
+
+				float mc = config::kSweepMinMeasureS * sweep_freq;
+				if (mc < (float)config::kSweepSettleCycles) mc = (float)config::kSweepSettleCycles;
+
+				if (is_speed)
+				{
+					speed_sweep_meas_cycles = (uint16_t)(mc + 0.999f);
+					speed_sweep_active = true;
+				}
+				else
+				{
+					sweep_meas_cycles = (uint16_t)(mc + 0.999f);
+					sweep_isr_active = true;
+				}
 			}
 			else if (cmd_.test_type == 5)
 			{
-				l_state = 1;			// 启动 Ld/Lq 阶跃辨识
-				l_tick = 0;
-				l_i0 = 0.0f;
+				// Lq 会被反电势 ωe·ψf 污染，必须静止测量
+				const float rpm_now = (encoder != nullptr) ? encoder->Get_Mech_Rpm() : 0.0f;
+
+				if (fabsf(rpm_now) < 15.0f)
+				{
+					l_ld = 0.0f;
+					l_lq = 0.0f;
+					l_rep = 0;
+					l_cnt_d = 0;
+					l_cnt_q = 0;
+					r_cnt = 0;
+					l_sine_axis = 0;
+					l_freq_idx = 0;
+					l_z1 = 0.0f;
+					l_sine_f = config::kLSineF1;
+					l_sine_cycles = 0;
+					l_sine_phase = 0.0f;
+					l_sine_i = 0.0f;
+					l_sine_q = 0.0f;
+					l_sine_n = 0;
+					l_state = 1;			// 启动 Ld/Lq 双频阻抗辨识
+				}
 			}
 		}
 
 		test_type = cmd_.test_type;
-		test_amp = cmd_.test_amp;
-		test_freq = cmd_.test_freq;
-		test_center_speed = cmd_.speed_rpm;
-		test_center_pos = cmd_.position_deg * (foc_math::PI / 180.0f);
 
 		// 控制器的使能/目标/位置指针会被 20kHz ADC 中断读取，
 		// 这里用临界区保证 ISR 看不到"改到一半"的状态（和旧代码一致）。
@@ -621,6 +1334,87 @@ namespace app
 			pi_tuned = false;
 		}
 
+		// PI 位置式 / 增量式切换（调试开关，只在变化时切一次，
+		// 切换内部会把状态对齐，不会产生输出台阶）
+		if (cmd_.pi_incremental != pi_incremental)
+		{
+			pi_incremental = cmd_.pi_incremental;
+			controller.Set_Pi_Incremental(pi_incremental);
+		}
+
+		// 板内捕获：命令上升沿触发一次（上位机只发一帧）
+		if (cmd_.capture && !last_capture_cmd)		{
+			// 自适应抽取：按当前扫频频率算，目标覆盖 10 个周期，
+			// 最长 5 秒（电流 20kHz → D≤97，转速 4kHz → D≤19）。
+			const uint16_t cap_fs = (test_type == 4) ? 4000u : 20000u;
+
+			float f = 0.0f;
+			if ((test_type == 3 || test_type == 4) && sweep_freq > 0.0f)
+			{
+				f = sweep_freq;
+			}
+
+			uint16_t d = 1;
+
+			if (f > 0.01f)
+			{
+				const float target = 10.0f * (float)cap_fs
+								   / (f * (float)CaptureBuffer::POINTS);
+				if (target > 1.0f) d = (uint16_t)(target + 0.5f);
+			}
+
+			const uint16_t dmax = (uint16_t)(5.0f * (float)cap_fs
+											/ (float)CaptureBuffer::POINTS);
+			if (d > dmax) d = dmax;
+			if (d < 1u) d = 1u;
+
+			capture.Arm(d, cap_fs);
+		}
+		last_capture_cmd = cmd_.capture;
+
+		// Ld/Lq 双频辨识：命令上升沿触发一次（和 test_type 解耦）
+		if (cmd_.l_ident && !last_l_ident_cmd)
+		{
+			const float rpm_now = (encoder != nullptr) ? encoder->Get_Mech_Rpm() : 0.0f;
+
+			if (fabsf(rpm_now) < 15.0f && l_state == 0)
+			{
+				l_ld = 0.0f;
+				l_lq = 0.0f;
+				l_rep = 0;
+				l_cnt_d = 0;
+				l_cnt_q = 0;
+				r_cnt = 0;
+				l_sine_axis = 0;
+				l_freq_idx = 0;
+				l_z1 = 0.0f;
+				l_sine_f = config::kLSineF1;
+				l_sine_cycles = 0;
+				l_sine_phase = 0.0f;
+				l_sine_i = 0.0f;
+				l_sine_q = 0.0f;
+				l_sine_n = 0;
+				l_state = 1;
+			}
+		}
+		last_l_ident_cmd = cmd_.l_ident;
+
+		// 齿槽补偿：建表上升沿触发一次；使能是电平
+		cog_enabled = cmd_.cog_enable;
+		cog_invert = cmd_.cog_invert;
+
+		if (cmd_.cog_learn && !last_cog_learn_cmd)
+		{
+			Cogging_Start();
+		}
+		last_cog_learn_cmd = cmd_.cog_learn;
+
+		// 学习期间锁住 8rpm，别被 20Hz 命令流覆盖
+		if (cog_learning)
+		{
+			controller.Set_Speed_Target(config::kCogLearnRpm);
+		}
+
 		// 转速环 PI 在线整定
 		if (cmd_.tune_speed)
 		{
@@ -666,6 +1460,7 @@ namespace app
 			controller.Set_Enable(false);
 			speed_loop = false;
 			position_loop = false;
+			mit_active = false;		// 下次切回 MIT 必须重新用当前位置初始化目标
 			last_mod = {0.0f, 0.0f};
 
 			// 波形观察强制不使能；强拖跟随上位机
@@ -687,6 +1482,7 @@ namespace app
 		const bool encoder_ready = config::kEncoderEnable && encoder != nullptr && encoder->Is_Valid();
 		const bool use_position_loop = (cmd_.mode == MODE_POSITION) && encoder_ready;
 		const bool use_speed_loop = ((cmd_.mode == MODE_ENCODER) || use_position_loop) && encoder_ready;
+		const bool use_mit = (cmd_.mode == MODE_MIT) && encoder_ready;
 
 		// 编码器有效时，电流环也使用编码器角度。
 		// 电流模式如果继续用固定开环角，电流一大转子一动，d/q 坐标系就不跟着转子，
@@ -721,23 +1517,33 @@ namespace app
 				// 轨迹规划从当前位置启动：否则一进位置模式 z1=0，目标会瞬移
 				pos_td_x1 = encoder->Get_Mech_Angle_Rad();
 				pos_td_x2 = 0.0f;
+				pos_td_a = 0.0f;
 				pos_d_filt = encoder->Get_Mech_Rpm() * (foc_math::TWO_PI / 60.0f);
 				pos_db_hold = false;
 			}
 
 			position_loop = true;
 			speed_loop = true;
+			mit_active = false;
 		}
 		else if (use_speed_loop)
 		{
 			position_loop = false;
+			mit_active = false;
+			controller.Set_Iq_Feedforward(0.0f);	// 非位置模式不保留加速度前馈
 
-			if (mode_changed || !speed_loop || last_speed_target != cmd_.speed_rpm)
+			// 速度正弦刚结束的那一条命令：强制把目标写回 cmd_.speed_rpm。
+			// 否则 speed_target 停在最后一个正弦值（最多 ±test_amp），
+			// 而 last_speed_target 仍等于 cmd_.speed_rpm，不会触发重写。
+			const bool sine_just_ended = (prev_test_type == 1 && cmd_.test_type != 1);
+
+			if (mode_changed || !speed_loop || last_speed_target != cmd_.speed_rpm || sine_just_ended)
 			{
 				controller.Set_Speed_Target(cmd_.speed_rpm);
 
-				// 只在进入转速环时清一次积分；目标值微调不重置积分
-				if (mode_changed || !speed_loop)
+				// 只在进入转速环/正弦结束重新同步时清一次积分；
+				// 目标值微调不重置积分
+				if (mode_changed || !speed_loop || sine_just_ended)
 				{
 					controller.Reset_Speed_Pi();
 				}
@@ -747,15 +1553,63 @@ namespace app
 
 			speed_loop = true;
 		}
+		else if (use_mit)
+		{
+			// MIT 阻抗：力矩级，关掉转速/位置环，4kHz 的 Mit_Step 直接写 iq。
+			position_loop = false;
+			speed_loop = false;
+			controller.Set_Iq_Feedforward(0.0f);
+
+			// 参数限幅挡住 NaN / 误输入，避免一个错误增益把电机推到硬件限流
+			mit_kp = Clamp_Gain(cmd_.mit_kp, 0.0f, config::kMitMaxKp);
+			mit_kd = Clamp_Gain(cmd_.mit_kd, 0.0f, config::kMitMaxKd);
+			// 速度/前馈遇到 NaN 或越界直接回 0：不能用 Clamp_Gain 回下限，
+			// 否则一条坏命令会变成 -300rad/s 或 -1N·m。
+			mit_vel_des = (cmd_.mit_vel_des > -config::kMitVelMax
+						   && cmd_.mit_vel_des < config::kMitVelMax)
+						  ? cmd_.mit_vel_des : 0.0f;
+			mit_tau_ff = (cmd_.mit_tau_ff > -config::kMitTauFfMax
+						  && cmd_.mit_tau_ff < config::kMitTauFfMax)
+						 ? cmd_.mit_tau_ff : 0.0f;
+
+			float tlim = (cmd_.mit_tau_limit > 0.0f) ? cmd_.mit_tau_limit : config::kMitDefaultTauLimit;
+			mit_tau_limit = Clamp_Gain(tlim, 0.0f, config::kMitTauLimitMax);
+
+			if (!cmd_.enable)
+			{
+				mit_active = false;
+			}
+			else if (mode_changed || !mit_active)
+			{
+				// 刚进 MIT：目标先取当前位置，避免上位机默认目标 0 让转子猛弹一下。
+				// 下一条命令（50ms 后）再跟随上位机给的目标。
+				mit_pos_des = encoder->Get_Mech_Angle_Rad();
+				mit_pos_slew = mit_pos_des;
+				mit_gain_scale = 0.0f;
+				mit_active = true;
+			}
+			else
+			{
+				float pdes = cmd_.mit_pos_des;
+
+				// 目标角必须是有限值；坏值就保持上一拍目标
+				if (!(pdes > -1.0e6f && pdes < 1.0e6f)) pdes = mit_pos_des;
+
+				mit_pos_des = pdes;
+			}
+		}
 		else
 		{
 			position_loop = false;
-
-			// 转速/位置模式但编码器无效：不要拿旧的 iq 继续跑，直接给 0
-			const float fallback_iq =
-				(cmd_.mode == MODE_ENCODER || cmd_.mode == MODE_POSITION) ? 0.0f : cmd_.iq_a;
-			controller.Set_Target(cmd_.id_a, fallback_iq);
 			speed_loop = false;
+			mit_active = false;
+			controller.Set_Iq_Feedforward(0.0f);	// 非位置模式不保留加速度前馈
+
+			// 转速/位置/MIT 模式但编码器无效：不要拿旧的 iq 继续跑，直接给 0
+			const float fallback_iq =
+				(cmd_.mode == MODE_ENCODER || cmd_.mode == MODE_POSITION
+				 || cmd_.mode == MODE_MIT) ? 0.0f : cmd_.iq_a;
+			controller.Set_Target(cmd_.id_a, fallback_iq);
 		}
 
 		// 从开环切回闭环时也要重新使能控制器
@@ -768,6 +1622,13 @@ namespace app
 			if (use_speed_loop && cmd_.enable)
 			{
 				controller.Reset_Speed_Pi();
+			}
+
+			// MIT 重新使能：增益软启动从头开始
+			if (use_mit && cmd_.enable)
+			{
+				controller.Reset_Speed_Pi();
+				mit_gain_scale = 0.0f;
 			}
 
 			// 开环期间没有更新过 last_mod，切回闭环时从零矢量开始
@@ -804,6 +1665,7 @@ namespace app
 			requested_enable = false;
 			speed_loop = false;
 			position_loop = false;
+			mit_active = false;
 			open_loop.Set_Active(false);
 			position = &open_loop_position;
 			open_loop_position.Set_Speed(0.0f);
@@ -822,6 +1684,7 @@ namespace app
 		mode = MODE_CURRENT;
 		speed_loop = false;
 		position_loop = false;
+		mit_active = false;
 
 		position = &open_loop_position;
 		open_loop_position.Set_Angle(0.0f);
@@ -846,6 +1709,7 @@ namespace app
 			requested_enable = false;
 			speed_loop = false;
 			position_loop = false;
+			mit_active = false;
 			open_loop.Set_Active(false);
 			position = &open_loop_position;
 			open_loop_position.Set_Speed(0.0f);
@@ -958,6 +1822,7 @@ namespace app
 		requested_enable = false;
 		speed_loop = false;
 		position_loop = false;
+		mit_active = false;
 		cal_point = 0;
 		open_loop.Set_Active(false);
 		position = &open_loop_position;
@@ -1033,11 +1898,44 @@ namespace app
 		pi_ki_q = controller.Get_Ki_Q();
 		iq_target = controller.Get_Iq_Target();
 		id_target = controller.Get_Id_Target();
-		speed_target_rpm = controller.Get_Speed_Target();
-		pos_target_deg = target_position_rad * (180.0f / foc_math::PI);
+		// MIT 模式没有转速/位置环，遥测里把 MIT 目标映射到这两个字段，
+		// 上位机现有的“角度/转速参考线”直接就能看到 MIT 目标。
+		if (mode == MODE_MIT)
+		{
+			speed_target_rpm = mit_vel_des * 60.0f / foc_math::TWO_PI;
+			pos_target_deg = mit_pos_des * (180.0f / foc_math::PI);
+		}
+		else
+		{
+			speed_target_rpm = controller.Get_Speed_Target();
+			pos_target_deg = target_position_rad * (180.0f / foc_math::PI);
+		}
 		test_freq_now = this->test_freq_now;
 		vd_now = controller.Get_Voltage_Dq().d;
 		vq_now = controller.Get_Voltage_Dq().q;
+
+		// 扫频时，vd/vq 两个字段借用来回传板内解调结果：
+		//   vd = 幅值 (dB)，vq = 相位 (度)
+		// 上位机按 test_freq_now 去重收集每个频点。
+		if (test_type == 3 || test_type == 4)
+		{
+			const bool sweep_on = (test_type == 3) ? sweep_isr_active : speed_sweep_active;
+
+			test_freq_now = sweep_on
+							? (sweep_res_valid ? sweep_res_freq : sweep_freq)
+							: 0.0f;
+
+			if (sweep_res_valid)
+			{
+				vd_now = sweep_res_mag_db;
+				vq_now = sweep_res_phase_deg;
+			}
+			else
+			{
+				vd_now = 999.0f;		// 结果未就绪的哨兵值
+				vq_now = 999.0f;
+			}
+		}
 		ld_h = l_ld;
 		lq_h = l_lq;
 		speed_kp = controller.Get_Speed_Kp();
@@ -1087,6 +1985,12 @@ namespace app
 		snapshot.speed_ki = speed_ki;
 		snapshot.pos_kp = pos_kp;
 		snapshot.pos_kd = pos_kd;
+		snapshot.tau_cmd = controller.Get_Torque_Target();
+		snapshot.mit_pos_des = mit_pos_des;
+		snapshot.mit_vel_des = mit_vel_des;
+		snapshot.mit_kp = mit_kp;
+		snapshot.mit_kd = mit_kd;
+		snapshot.mit_tau_ff = mit_tau_ff;
 		snapshot.kp_d = pi_kp_d;
 		snapshot.ki_d = pi_ki_d;
 		snapshot.kp_q = pi_kp_q;
@@ -1094,6 +1998,12 @@ namespace app
 		snapshot.offs_a = offs_a;
 		snapshot.offs_b = offs_b;
 		snapshot.offs_c = offs_c;
+		snapshot.motor_temp = motor_temp_latched;
+		snapshot.driver_temp = driver_temp_latched;
+		snapshot.thermal_state = thermal_state;
+		snapshot.psi_est_mwb = psi_est * 1000.0f;
+		snapshot.psi_state = psi_state;
+		snapshot.cog_state = (cog_valid ? 1u : 0u) | (cog_learning ? 2u : 0u) | (cog_enabled ? 4u : 0u);
 
 		if (open)
 		{

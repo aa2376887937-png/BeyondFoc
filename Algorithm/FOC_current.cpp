@@ -4,7 +4,8 @@ namespace foc_current
 {
 	namespace
 	{
-		// 三数中值
+#if 0		// Med3：保留备用（电流环反馈已不用中值——3 点中值 = 1 拍延迟，
+		// 1kHz 带宽下 18° 相位损失，相位裕度代价太大）
 		float Med3(float a, float b, float c)
 		{
 			if (a > b) { const float t = a; a = b; b = t; }
@@ -12,6 +13,7 @@ namespace foc_current
 			if (a > b) { const float t = a; a = b; b = t; }
 			return b;
 		}
+#endif
 	}
 
 	Processor::Processor()
@@ -58,9 +60,6 @@ namespace foc_current
 		cal_target = samples_;
 		cal_settle = settle_;
 		calibrating = true;
-
-		hist_idx = 0;
-		hist_n = 0;
 	}
 
 	bool Processor::Update(const Raw &raw_)
@@ -110,26 +109,15 @@ namespace foc_current
 		current.b = (raw.b - offset.b) * scale * sign.b;
 		current.c = (raw.c - offset.c) * scale * sign.c;
 
-		// 3 点中值：杀掉单点 ADC 毛刺（PI 吃的是中值，不是瞬时值）
-		hist[0][hist_idx] = current.a;
-		hist[1][hist_idx] = current.b;
-		hist[2][hist_idx] = current.c;
-
-		hist_idx = (uint8_t)((hist_idx + 1u) % 3u);
-		if (hist_n < 3u) hist_n++;
-
-		if (hist_n >= 3u)
-		{
-			current.a = Med3(hist[0][0], hist[0][1], hist[0][2]);
-			current.b = Med3(hist[1][0], hist[1][1], hist[1][2]);
-			current.c = Med3(hist[2][0], hist[2][1], hist[2][2]);
-		}
-
 		// 遥测平均：累加本周期瞬时值，1kHz 里取平均（抗混叠）
 		sum_a += current.a;
 		sum_b += current.b;
 		sum_c += current.c;
 		sum_n++;
+
+		// 注意：不再做 3 点中值。中值 = 1 拍 (50µs) 延迟，在电流环 1kHz
+		// 带宽下就是 18° 相位损失，占了相位裕度的一大块。ADC 毛刺由
+		// 注入组采样窗口远离开关沿来抑制；需要统计去毛刺时在遥测侧做。
 
 		return true;
 	}

@@ -76,6 +76,16 @@ namespace protocol
 				cmd.test_type = buffer[50];
 				memcpy(&cmd.test_amp, &buffer[51], 4);
 				memcpy(&cmd.test_freq, &buffer[55], 4);
+				memcpy(&cmd.plan_vmax, &buffer[59], 4);
+				memcpy(&cmd.plan_accel, &buffer[63], 4);
+
+				// MIT 阻抗：payload 偏移 63 起（buffer 从 4 开始）
+				memcpy(&cmd.mit_pos_des, &buffer[67], 4);
+				memcpy(&cmd.mit_vel_des, &buffer[71], 4);
+				memcpy(&cmd.mit_kp, &buffer[75], 4);
+				memcpy(&cmd.mit_kd, &buffer[79], 4);
+				memcpy(&cmd.mit_tau_ff, &buffer[83], 4);
+				memcpy(&cmd.mit_tau_limit, &buffer[87], 4);
 
 				cmd.iq_a = (float)iq_ma * 0.001f;
 				cmd.id_a = (float)id_ma * 0.001f;
@@ -87,6 +97,12 @@ namespace protocol
 				cmd.tune_pi = ((flags & FLAG_TUNE_PI) != 0u);
 				cmd.tune_speed = ((flags & FLAG_TUNE_SPEED_PI) != 0u);
 				cmd.tune_pos = ((flags & FLAG_TUNE_POS_PI) != 0u);
+				cmd.pi_incremental = ((flags & FLAG_PI_INCREMENTAL) != 0u);
+				cmd.capture = ((flags & FLAG_CAPTURE) != 0u);
+				cmd.l_ident = ((flags & FLAG_L_IDENT) != 0u);
+				cmd.cog_learn = ((flags & FLAG_COG_LEARN) != 0u);
+				cmd.cog_enable = ((flags & FLAG_COG_ENABLE) != 0u);
+				cmd.cog_invert = ((flags & FLAG_COG_INVERT) != 0u);
 
 				latest = cmd;
 				ready = true;
@@ -142,7 +158,11 @@ namespace protocol
 	 *   132..135 float vq
 	 *   136..137 uint16 ld_x10  (0.1µH)
 	 *   138..139 uint16 lq_x10  (0.1µH)
-	 *   140      XOR(2..139)
+	 *   140      int8   motor_temp (°C，NTC 异常时 = -100)
+	 *   141      int8   driver_temp (°C)
+	 *   142      uint8  thermal_state (0=正常 1=降流 2=停机)
+	 *   143      uint8  reserved
+	 *   144      XOR(2..143)
 	 *------------------------------------------------------------------------------*/
 	uint16_t Encode_Scope(const app::ScopeData &data_, uint8_t *out_, uint16_t capacity_)
 	{
@@ -206,6 +226,36 @@ namespace protocol
 		memcpy(&frame[132], &data_.vq, 4);
 		memcpy(&frame[136], &data_.ld_x10, 2);
 		memcpy(&frame[138], &data_.lq_x10, 2);
+
+		// 温度：int8 存不下 -273，NTC 异常时发哨兵值 -100（上位机显示 "NTC?"）
+		{
+			int8_t t_mot = -100;
+			int8_t t_drv = -100;
+
+			if (data_.motor_temp > -50.0f && data_.motor_temp < 120.0f)
+			{
+				t_mot = (int8_t)(data_.motor_temp + 0.5f);
+				if (t_mot > 120) t_mot = 120;
+			}
+
+			if (data_.driver_temp > -50.0f && data_.driver_temp < 120.0f)
+			{
+				t_drv = (int8_t)(data_.driver_temp + 0.5f);
+				if (t_drv > 120) t_drv = 120;
+			}
+
+			frame[140] = (uint8_t)t_mot;
+			frame[141] = (uint8_t)t_drv;
+			frame[142] = data_.thermal_state;
+			frame[143] = data_.psi_state;
+		}
+
+		// 在线磁链估计 (mWb)
+		memcpy(&frame[144], &data_.psi_est_mwb, 4);
+
+		// 齿槽补偿状态
+		frame[148] = data_.cog_state;
+
 		seq++;
 
 		uint8_t checksum = 0;
@@ -213,5 +263,68 @@ namespace protocol
 		frame[4u + SCOPE_PAYLOAD] = checksum;
 
 		return SCOPE_FRAME_SIZE;
+	}
+
+	/*------------------------------------------------------------------------------
+	 * 板内捕获分块编码
+	 *
+	 *   payload:
+	 *     0..1   uint16 seq      本块序号（第 seq*8 个点开始）
+	 *     2..3   uint16 total    总点数
+	 *     4      uint8  count    本块点数
+	 *     5      uint8  channels 通道数（4）
+	 *     6..7   uint16 decim    抽取比
+	 *     8..9   uint16 fs       原始采样率 (Hz)
+	 *     10..   float32[count][channels]
+	 *     其余补 0
+	 *------------------------------------------------------------------------------*/
+	uint16_t Encode_Capture(const app::CaptureBuffer &cap_, uint16_t seq_,
+							uint8_t *out_, uint16_t capacity_)
+	{
+		if (capacity_ < CAPTURE_FRAME_SIZE) return 0;
+		if (!cap_.ready) return 0;
+
+		const uint16_t total = cap_.len;
+		const uint16_t first = (uint16_t)(seq_ * CAPTURE_CHUNK);
+
+		if (first >= total) return 0;
+
+		uint16_t count = CAPTURE_CHUNK;
+		if ((uint32_t)first + count > total) count = (uint16_t)(total - first);
+
+		out_[0] = HEADER0;
+		out_[1] = HEADER1;
+		out_[2] = CAPTURE_TYPE;
+		out_[3] = CAPTURE_PAYLOAD;
+
+		uint8_t *p = &out_[4];
+
+		for (uint16_t i = 0; i < CAPTURE_PAYLOAD; i++) p[i] = 0;
+
+		uint16_t off = 0;
+		memcpy(&p[off], &seq_, 2);		off += 2;
+		memcpy(&p[off], &total, 2);		off += 2;
+		p[off++] = (uint8_t)count;
+		p[off++] = app::CaptureBuffer::CHANNELS;
+
+		const uint16_t decim = cap_.decim;
+		const uint16_t fs = cap_.fs;
+		memcpy(&p[off], &decim, 2);		off += 2;
+		memcpy(&p[off], &fs, 2);		off += 2;
+
+		for (uint16_t i = 0; i < count; i++)
+		{
+			for (uint8_t ch = 0; ch < app::CaptureBuffer::CHANNELS; ch++)
+			{
+				memcpy(&p[off], &cap_.data[first + i][ch], 4);
+				off += 4;
+			}
+		}
+
+		uint8_t checksum = 0;
+		for (uint16_t i = 2; i < 4u + CAPTURE_PAYLOAD; i++) checksum ^= out_[i];
+		out_[4u + CAPTURE_PAYLOAD] = checksum;
+
+		return CAPTURE_FRAME_SIZE;
 	}
 }

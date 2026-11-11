@@ -7,17 +7,43 @@ namespace app
 						 const framework::Latest<ControlSnapshot> &control_,
 						 const framework::Latest<EncoderSnapshot> &encoder_,
 						 const framework::Latest<PowerSnapshot> &power_,
-						 const SystemState &state_)
+						 const SystemState &state_,
+						 CaptureBuffer &capture_)
 		: port(port_)
 		, control(control_)
 		, encoder(encoder_)
 		, power(power_)
 		, state(state_)
+		, capture(capture_)
 	{
 	}
 
 	void Telemetry::Send()
 	{
+		// 板内捕获优先：分块发送期间暂停普通遥测。
+		// 1024 点 / 每帧 8 点 = 128 帧 = 128ms，期间波形不动是正常的。
+		if (capture.ready)
+		{
+			uint8_t frame[protocol::CAPTURE_FRAME_SIZE];
+			const uint16_t len = protocol::Encode_Capture(capture, cap_seq, frame, sizeof(frame));
+
+			if (len != 0)
+			{
+				port.Write(frame, len);
+				cap_seq++;
+
+				if ((uint32_t)cap_seq * protocol::CAPTURE_CHUNK >= capture.len)
+				{
+					capture.ready = false;
+					cap_seq = 0;
+				}
+				return;
+			}
+
+			capture.ready = false;
+			cap_seq = 0;
+		}
+
 		ControlSnapshot c;
 		if (!control.Try_Read(c) || !c.valid) return;
 
@@ -57,6 +83,12 @@ namespace app
 		data.vq = c.vq;
 		data.ld_x10 = (uint16_t)((c.ld_h * 1.0e7f) + 0.5f);		// H → 0.1µH
 		data.lq_x10 = (uint16_t)((c.lq_h * 1.0e7f) + 0.5f);
+		data.motor_temp = c.motor_temp;
+		data.driver_temp = c.driver_temp;
+		data.thermal_state = c.thermal_state;
+		data.psi_est_mwb = c.psi_est_mwb;
+		data.psi_state = c.psi_state;
+		data.cog_state = c.cog_state;
 
 		uint16_t status = 0;
 		if (c.output_enable) status |= 0x01;

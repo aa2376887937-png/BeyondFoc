@@ -22,6 +22,9 @@ namespace app
 		encoder.Set_Pole_Pairs(config::kPolePairs);
 		encoder.Set_Direction(config::kEncoderDirection);
 		encoder.Set_Pll_Bandwidth(config::kPllBandwidthHz, config::kPllDamping);
+		encoder.Set_Speed_Lpf_Hz(config::kPllSpeedFilterHz);
+		encoder.Set_Speed_Filter_Hz(config::kEncoderSpeedFilterHz);
+		encoder.Set_Speed_Source_Pll(config::kUseSpeedPll);
 		encoder.Set_Clock(SystemCoreClock);
 
 		if (config::kEncoderEnable)
@@ -41,20 +44,17 @@ namespace app
 	{
 		(void)dt;
 
-		// 编码器帧在任务里消费：DMA 只保存最新帧，控制中断只读最新角度/速度。
+		// 编码器帧已改由 20kHz 电流环中断直接消费（速度估计 20kHz 更新），
+		// 这里只做看门狗/异常重启，不再取帧。
 		if (config::kEncoderEnable)
 		{
-			encoder::Frame frame;
-			if (spi.Try_Take_Frame(frame))
-			{
-				encoder.Consume(frame);
-			}
-
 			spi.Poll();			// 看门狗 + 异常时重启
 		}
 
-		// 1. 100Hz 慢速模拟量（监控任务 4kHz，40 次 = 10ms）
-		if (++power_div >= 40)
+		// 1. 400Hz 模拟量（监控任务 4kHz，10 次 = 2.5ms）。
+		//    v_bus 直接进调制增益 √3/Vbus，100Hz 更新最多滞后 10ms，
+		//    母线波动会等效成电流环增益漂移，提到 400Hz 缓解。
+		if (++power_div >= 10)
 		{
 			power_div = 0;
 			Read_Power();

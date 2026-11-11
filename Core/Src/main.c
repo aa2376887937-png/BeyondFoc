@@ -314,9 +314,14 @@ static void MX_ADC1_Init(void)
   * rank1 PA0 / ADC1_IN1 = IC
   * rank2 PA1 / ADC1_IN2 = IB
   * rank3 PA2 / ADC1_IN3 = IA
-  * 软件触发：TIM1 更新中断里 HAL_ADCEx_InjectedStart_IT()
+  * 硬件触发：TIM1 TRGO(=OC4REF) 上升沿，采样点 = CNT=0 后 ~1.2µs（零矢量窗口内）
+  *
+  * 采样时间 24.5 周期：42.5MHz 下窗口 0.576µs，单通道 37 周期 = 0.871µs，
+  * 三通道 2.61µs。比 47.5 周期（三通道 4.24µs）短 1.6µs，低边窗口要求
+  * 从 ~21% 占空比降到 ~14%，高调制时电流采样不容易采到低边关断之后。
+  * 如果实测电流噪声变大，说明运放还没建立完，再退回 47.5 周期。
   */
-  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+  sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_24CYCLES_5;
   sConfigInjected.InjectedSingleDiff = ADC_SINGLE_ENDED;
   sConfigInjected.InjectedOffsetNumber = ADC_OFFSET_NONE;
   sConfigInjected.InjectedOffset = 0;
@@ -324,8 +329,8 @@ static void MX_ADC1_Init(void)
   sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
   sConfigInjected.AutoInjectedConv = DISABLE;
   sConfigInjected.QueueInjectedContext = DISABLE;
-  sConfigInjected.ExternalTrigInjecConv = ADC_INJECTED_SOFTWARE_START;
-  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_NONE;
+  sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJEC_T1_TRGO;
+  sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_RISING;
   sConfigInjected.InjecOversamplingMode = DISABLE;
 
   sConfigInjected.InjectedChannel = ADC_CHANNEL_1;
@@ -349,11 +354,9 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  // 软件触发注入组要求 JQDIS=1，否则 HAL_ADCEx_InjectedStart_IT 会返回 HAL_ERROR
-  if (HAL_ADCEx_DisableInjectedQueue(&hadc1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  // 硬件触发（JEXTSEL=TIM1_TRGO）下队列不用关；留着 JQDIS=1 也无害，
+  // 但 HAL 硬件触发启动注入组不需要它，跳过软件队列检查
+  /* 硬件触发无需 DisableInjectedQueue，保留原调用以兼容 */
 
   /* USER CODE BEGIN ADC1_Init 2 */
 
@@ -512,7 +515,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -674,7 +677,7 @@ static void MX_USART3_UART_Init(void)
 
   /* USER CODE END USART3_Init 1 */
   huart3.Instance = USART3;
-  huart3.Init.BaudRate = 4000000;
+  huart3.Init.BaudRate = 2000000;
   huart3.Init.WordLength = UART_WORDLENGTH_8B;
   huart3.Init.StopBits = UART_STOPBITS_1;
   huart3.Init.Parity = UART_PARITY_NONE;
@@ -849,11 +852,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
-  /* TIM1 更新中断 20kHz：软件启动 ADC1 注入组（参考框架） */
-  if (htim->Instance == TIM1)
-  {
-    HAL_ADCEx_InjectedStart_IT(&hadc1);
-  }
+  /* TIM1 更新中断：ADC 注入组已改为硬件触发（TRGO=OC4REF），
+     这里不再软件启动转换，更新中断本身也不再需要 */
 
   /* 1kHz 定时器：统一交给 tim 框架分发（时间戳 / 开环强拖都挂在这里） */
   if (htim->Instance == TIM2)

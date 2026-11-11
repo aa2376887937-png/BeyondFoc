@@ -100,7 +100,16 @@ namespace encoder
 	bool SpiEncoder::Try_Take_Frame(Frame &frame_)
 	{
 		// 只取最新一帧；读到一半被 DMA 中断打断就返回 false，下一轮再取
-		return latest.Try_Read(frame_);
+		if (!latest.Try_Read(frame_)) return false;
+
+		// Latest 是"邮箱"不是队列：没有新帧时它会反复返回同一帧。
+		// 监控任务 4kHz 消费，如果某一拍没有新帧（SPI 抖动/限速），
+		// 重复消费同一帧会让 dt_s=0 -> 走 1ms 兜底、implied=0 -> 可信度
+		// 检查误判为坏帧 -> 速度尖峰。这里用时间戳挡住重复帧。
+		if (frame_.cycles == last_taken_cycles) return false;
+
+		last_taken_cycles = frame_.cycles;
+		return true;
 	}
 
 	void SpiEncoder::On_TxRx_Cplt(SPI_HandleTypeDef *hspi_)
@@ -113,8 +122,15 @@ namespace encoder
 		self->reading = false;
 		self->Push_Raw(self->rx_buf, DWT->CYCCNT);
 
-		// DMA 完成中断只负责启动下一帧，不做帧解析
-		self->Start_Read();
+		// DMA 完成中断只负责启动下一帧，不做帧解析。
+		// 编码器帧现在由 20kHz 电流环中断消费，帧产出限到 20kfps
+		// （10.6MHz 下一帧约 4µs，占空比 ~8%），保证每拍都有新帧。
+		static uint32_t last_start = 0;
+		if ((DWT->CYCCNT - last_start) > (SystemCoreClock / 20000u))
+		{
+			last_start = DWT->CYCCNT;
+			self->Start_Read();
+		}
 	}
 
 	void SpiEncoder::On_Error(SPI_HandleTypeDef *hspi_)

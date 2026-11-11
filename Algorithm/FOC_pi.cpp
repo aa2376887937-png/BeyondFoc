@@ -46,10 +46,29 @@ void Pi_Controller::Set_Integral_Separation(float error_band_)
 	int_sep = fabsf(error_band_);
 }
 
+void Pi_Controller::Set_Incremental(bool on_)
+{
+	if (on_ == incremental) return;
+
+	if (on_)
+	{
+		// 位置式 → 增量式：out_prev 在位置式里每拍都记着实际输出，
+		// 直接拿来当增量式的状态即可（饱和时也是对的，不会跳）。
+	}
+	else
+	{
+		// 增量式 → 位置式：反推积分项，保证下一次输出不变
+		integral = out_prev - kp * prev_error;
+	}
+
+	incremental = on_;
+}
+
 void Pi_Controller::Reset()
 {
 	integral = 0.0f;
 	prev_error = 0.0f;
+	out_prev = 0.0f;
 }
 
 /*------------------------------------------------------------------------------
